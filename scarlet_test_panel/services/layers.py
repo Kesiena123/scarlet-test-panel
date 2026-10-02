@@ -26,7 +26,7 @@ def _default_layers():
     # is hardcoded from the reference image (promt1.txt).
     return [{"number": i + 1,
              "cal_position": 0.0,
-             "name": f"Layer {i + 1}"} for i in range(LAYER_COUNT)]
+             "name": f"Wrap {i + 1}"} for i in range(LAYER_COUNT)]
 
 
 def _clean_ref(value, default=0.0):
@@ -79,20 +79,23 @@ def save_layers(layers):
         if isinstance(item, dict) and str(item.get("name", "") or "").strip():
             clean_names.append(str(item["name"]))
         else:
-            clean_names.append(f"Layer {i + 1}")
+            clean_names.append(f"Wrap {i + 1}")
     settings.save({"layer_positions": clean_refs, "layer_names": clean_names})
 
 
 def derive_layer(live_counter, cal_counters):
-    """Local mirror of the firmware rule (promt1.txt).
+    """Local mirror of the firmware rule (promt.txt).
 
-    currentLayer = the highest configured calibration-anchor counter at or below
-    the live encoder counter, else layer 1. Because the calibration is always
-    monotonic (BAD_ORDER rejected), the sorted counter index maps 1:1 to the
-    layer row, so "which counter band the live count is in" is unambiguous and
-    follows the PULSES the operator enters per layer. Used only for dashboard
-    precondition checks / display fallbacks; the authoritative currentLayer
-    always comes from the firmware report.
+    The "current layer" is the NUMBER OF FULLY COMPLETED LEVELS:
+      * while live_counter < P1                    -> 0  (Level 1 not complete)
+      * P1 <= live_counter < P2                    -> 1  (Level 1 complete)
+      * P2 <= live_counter < P3                    -> 2
+      * P3 <= live_counter < P4                    -> 3
+      * P4 <= live_counter                         -> 4
+      * live_counter > P4 -> 4 + floor((ct - P4) / (P4 - P3))
+    A level is counted ONLY once its END boundary (anchor counter) is reached.
+    Used for dashboard precondition checks / display fallbacks; the
+    authoritative currentLayer always comes from the firmware report.
     """
     anchors = []
     for c in cal_counters:
@@ -103,11 +106,25 @@ def derive_layer(live_counter, cal_counters):
         if v >= 0:
             anchors.append(v)
     anchors.sort()
-    layer = 1
+    if not anchors:
+        return 0
+    if live_counter < anchors[0]:
+        return 0
+    completed = 1
     for k, c in enumerate(anchors):
         if live_counter >= c:
-            layer = k + 1
-    return layer
+            completed = k + 1
+        else:
+            break
+    if completed < len(anchors):
+        return completed
+    last = anchors[-1]
+    gap = (last - anchors[-2]) if len(anchors) >= 2 else 1
+    if gap <= 0:
+        gap = 1
+    if live_counter <= last:
+        return len(anchors)
+    return len(anchors) + (live_counter - last) // gap
 
 
 __all__ = ["LAYER_COUNT", "load_layers", "save_layers", "derive_layer"]

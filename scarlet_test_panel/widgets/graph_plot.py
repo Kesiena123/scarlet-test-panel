@@ -8,7 +8,8 @@ from ..config import (
     SESSION_START, WINDOW_SECS, MS_PER_SAMPLE, BORDER, GRID_CLR,
     TEXT_DARK, TEXT_MID, TEXT_LITE,
     sensor_color, TWO_POINT_CAL,
-    CAL_MIN_CLR, CAL_MAX_CLR
+    CAL_MIN_CLR, CAL_MAX_CLR,
+    FT_TO_M, TREND_LIVE_WINDOW_S,
 )
 
 
@@ -315,7 +316,7 @@ class _HistorianTrendGraph(QWidget):
         for i in range(n_ticks):
             val = v_max - span * i / (n_ticks - 1)
             y = pt + ph * i / (n_ticks - 1)
-            lbl = f"{val:,.1f}"
+            lbl = f"{val:.1f}"
             tw = fm.horizontalAdvance(lbl)
             painter.drawText(QPointF(pl - tw - 8, y + fm.ascent() / 2 - 1), lbl)
 
@@ -378,114 +379,298 @@ class _HistorianTrendGraph(QWidget):
 
 
 class _IndustrialTrendGraph(QWidget):
-    """Industrial rectangular trend for the Block Position Monitor (promt1.txt).
+    """Industrial rectangular BLOCK POSITION vs TIME trend (promt1.txt).
 
-    Plain rectangular chart with a light grid, a black trace and a clear
-    plot-frame (the reference HMI look). Supports 1 Minute / 1 Hour history.
+    READ-ONLY trend chart: it only visualizes the existing authoritative
+    block position recorded by the sampler. Supports the professional time
+    ranges (LIVE / 1 / 5 / 10 / 30 MIN / 1 HOUR), FT/M chart units (feet stay
+    internal; meters = feet x FT_TO_M converted only at draw time), automatic
+    stable Y scaling, real-clock time labels, hover data inspection, a CURRENT
+    position marker and a PAUSED VIEW freeze (background recording always
+    continues).
 
-    `sample_fn(seconds)` returns an iterable of (timestamp, value) ordered
-    oldest->newest. Range selected with set_range_seconds().
+    `sample_fn(seconds)` returns an iterable of (timestamp, feet) ordered
+    oldest->newest covering at least the requested window.
     """
 
     RANGES = [
-        ("1 Minute", 60),
-        ("1 Hour", 3600),
+        ("LIVE", 0),
+        ("1 MIN", 60),
+        ("5 MIN", 300),
+        ("10 MIN", 600),
+        ("30 MIN", 1800),
+        ("1 HOUR", 3600),
     ]
 
-    def __init__(self, sample_fn, color, default_range_s=60, parent=None):
+    # Time-tick steps (seconds) chosen so a window shows at most ~6 labels,
+    # which keeps the clock labels readable and non-overlapping.
+    TIME_STEPS = (5, 10, 15, 30, 60, 150, 300, 450, 600, 900, 1800, 3600)
+
+    def __init__(self, sample_fn, color, default_range_s=0, parent=None):
         super().__init__(parent)
         self.sample_fn = sample_fn
         self.color = color
         self.range_s = default_range_s
+        self.unit = "FT"
+        self.paused = False
+        self.pause_anchor = None
+        self._hover_ts = None
+        self._hover_val = None
         self.setStyleSheet("background: transparent;")
         self.setMinimumHeight(240)
+        self.setMouseTracking(True)
 
+    # -- public controls -----------------------------------------------------
     def set_range_seconds(self, seconds):
-        self.range_s = float(seconds)
+        self.range_s = float(seconds or 0)
         self.update()
 
-    def _series(self):
-        return list(self.sample_fn(self.range_s))
+    def set_unit(self, unit):
+        """Chart display unit (FT / M). Internal feet values are untouched;
+        only the drawn labels/values convert (feet x 0.3048)."""
+        unit = unit if unit in ("FT", "M") else "FT"
+        if unit != self.unit:
+            self.unit = unit
+            self.update()
+
+    def set_paused(self, paused):
+        """Freeze ONLY the view. Sampling/recording keeps running (new samples
+        still land in the rolling buffer); RESUME shows the newest data again."""
+        self.paused = bool(paused)
+        self.pause_anchor = datetime.datetime.now() if self.paused else None
+        self._hover_ts = None
+        self._hover_val = None
+        self.update()
+
+    # -- helpers -------------------------------------------------------------
+    def _eff_now(self):
+        if self.paused and self.pause_anchor:
+            return self.pause_anchor
+        return datetime.datetime.now()
+
+    def _window_s(self):
+        if self.range_s and self.range_s > 0:
+            return float(self.range_s)
+        return float(TREND_LIVE_WINDOW_S)
+
+    def _is_center_mode(self):
+        # LIVE mode (range_s == 0) keeps the newest point at the horizontal
+        # center so the trace scrolls left into the past with blank future on
+        # the right (a real-time DCS / oscilloscope trace). Fixed ranges fill
+        # the full width with the newest point at the right edge.
+        return not (self.range_s and self.range_s > 0)
+
+    def _time_mapping(self, now):
+        """Return (left_ts, right_ts, window_s) describing the x-axis extent."""
+        window = self._window_s()
+        if self._is_center_mode():
+            half = window / 2.0
+            return now - datetime.timedelta(seconds=half), \
+                   now + datetime.timedelta(seconds=half), window
+        return now - datetime.timedelta(seconds=window), now, window
+
+    def _x_for(self, ts, left_ts, right_ts):
+        denom = (right_ts - left_ts).total_seconds()
+        if denom <= 1e-9:
+            return 0.0
+        return (ts - left_ts).total_seconds() / denom
+
+    def _unit_factor(self):
+        return FT_TO_M if self.unit == "M" else 1.0
+
+    def _series(self, window_s):
+        return list(self.sample_fn(window_s))
+
+    @staticmethod
+    def _time_step(window_s):
+        chosen = _IndustrialTrendGraph.TIME_STEPS[-1]
+        for s in _IndustrialTrendGraph.TIME_STEPS:
+            if window_s / s <= 6:
+                chosen = s
+                break
+        return chosen
+
+    @staticmethod
+    def _fmt_y(val, step):
+        if step >= 1.0:
+            return f"{val:.0f}"
+        if step >= 0.1:
+            return f"{val:.1f}"
+        return f"{val:.2f}"
+
+    def _y_px(self, val, lo, hi, pt, ph):
+        span = max(hi - lo, 1e-9)
+        y = pt + ph * (1.0 - (val - lo) / span)
+        return max(pt, min(pt + ph, y))
+
+    def _geometry(self):
+        return 70, 14, 16, 48
+
+    def mouseMoveEvent(self, event):
+        w, h = self.width(), self.height()
+        pl, pr, pt, pb = self._geometry()
+        pw, ph = max(w - pl - pr, 10), max(h - pt - pb, 10)
+        mx, my = event.x(), event.y()
+        if pl <= mx <= pl + pw and pt <= my <= pt + ph:
+            now = self._eff_now()
+            left_ts, right_ts, window = self._time_mapping(now)
+            pts = [(ts, v) for ts, v in self._series(window)
+                   if left_ts <= ts <= right_ts]
+            best_dist = float('inf')
+            best = None
+            for ts, val in pts:
+                xf = self._x_for(ts, left_ts, right_ts)
+                dist = abs(pl + pw * xf - mx)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = (ts, val)
+            if best is not None and best_dist <= 30:
+                self._hover_ts, self._hover_val = best
+            else:
+                self._hover_ts = None
+                self._hover_val = None
+        else:
+            self._hover_ts = None
+            self._hover_val = None
+        self.update()
+
+    def leaveEvent(self, event):
+        self._hover_ts = None
+        self._hover_val = None
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        pl, pr, pt, pb = 70, 18, 14, 44
+        pl, pr, pt, pb = self._geometry()
         pw, ph = max(w - pl - pr, 10), max(h - pt - pb, 10)
 
-        # Rectangular industrial frame (no rounded corners).
+        frame = QColor(0x44, 0x44, 0x44)
         painter.setBrush(QBrush(QColor(0xFF, 0xFF, 0xFC)))
-        painter.setPen(QPen(QColor(0x44, 0x44, 0x44), 1.2))
+        painter.setPen(QPen(frame, 1.2))
         painter.drawRect(0, 0, w - 1, h - 1)
 
-        now = datetime.datetime.now()
-        series = self._series()
-        cutoff = now - datetime.timedelta(seconds=self.range_s)
-        pts = [(ts, val) for (ts, val) in series if ts >= cutoff]
+        now = self._eff_now()
+        left_ts, right_ts, window = self._time_mapping(now)
+        pts = [(ts, v) for ts, v in self._series(window) if left_ts <= ts <= right_ts]
         if len(pts) < 1:
             painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(BORDER, 1))
+            painter.setPen(QPen(frame, 1.2))
             painter.drawRect(pl, pt, pw, ph)
+            empty_font = QFont("Segoe UI", 9, QFont.Bold)
+            painter.setFont(empty_font)
+            fm = QFontMetrics(empty_font)
+            base = "LIVE" if self._is_center_mode() else "TREND"
+            msg = f"AWAITING {base} DATA" if not self.paused \
+                else f"AWAITING {base} DATA  (PAUSED)"
+            painter.setPen(QPen(TEXT_MID))
+            painter.drawText(QPointF(pl + pw / 2 - fm.horizontalAdvance(msg) / 2,
+                                     pt + ph / 2 + fm.ascent() / 2 - 1), msg)
             return
 
-        vals = [v for _, v in pts]
-        v_min = min(0.0, min(vals))
-        v_max = max(vals) if max(vals) > v_min else v_min + 10.0
-        span = max(v_max - v_min, 1e-6)
-
-        # Gridlines + y-axis labels (light, rectangular).
+        cf = self._unit_factor()
+        vals = [v * cf for _, v in pts]
         n_ticks = 6
+
+        # Stable auto-scaling: data range + 10% margin, snapped to "nice" tick
+        # values so labels stay clean and tiny movements don't rescale wildly.
+        v_lo = min(vals)
+        v_hi = max(vals)
+        span = max(v_hi - v_lo, 1e-9)
+        pad = span * 0.10
+        lo0, hi0 = v_lo - pad, v_hi + pad
+        if hi0 <= lo0:
+            hi0 = lo0 + 1.0
+        raw = (hi0 - lo0) / (n_ticks - 1)
+        step_y = 10.0 ** math.floor(math.log10(raw))
+        for m in (1, 2, 5, 10):
+            if step_y * m * (n_ticks - 1) >= (hi0 - lo0):
+                step_y = step_y * m
+                break
+        lo = math.floor(lo0 / step_y) * step_y
+        hi = lo + step_y * (n_ticks - 1)
+        while hi < hi0:
+            hi += step_y
+        while lo > lo0:
+            lo -= step_y
+
+        # Grid + y-axis labels.
         font = QFont("Segoe UI", 9)
         painter.setFont(font)
         fm = QFontMetrics(font)
         for i in range(n_ticks):
             y = pt + ph * i / (n_ticks - 1)
+            val = hi - (hi - lo) * i / (n_ticks - 1)
             painter.setPen(QPen(GRID_CLR, 0.8, Qt.SolidLine))
             painter.drawLine(QPointF(pl, y), QPointF(pl + pw, y))
-            val = v_max - span * i / (n_ticks - 1)
-            lbl = f"{val:,.1f}"
+            lbl = self._fmt_y(val, step_y)
             tw = fm.horizontalAdvance(lbl)
             painter.setPen(QPen(TEXT_DARK))
             painter.drawText(QPointF(pl - tw - 7, y + fm.ascent() / 2 - 1), lbl)
 
-        # Time / x-axis labels (minutes ago).
-        step = self.range_s / n_ticks
-        for i in range(1, n_ticks):
-            x = pl + pw * (i / n_ticks)
-            secs_ago = self.range_s - i * step
-            lbl = f"-{secs_ago / 60:.0f}m"
-            tw = fm.horizontalAdvance(lbl)
-            painter.setPen(QPen(TEXT_DARK))
-            painter.drawText(QPointF(x - tw / 2, pt + ph + fm.height() + 3), lbl)
+        # Time axis: real-clock labels aligned to the visible extent.
+        # (In LIVE/center mode the "now" line sits at the horizontal middle;
+        #  left = past, right = future.)
+        left_ts_ep = left_ts.timestamp()
+        right_ts_ep = right_ts.timestamp()
+        step_t = self._time_step(window)
+        font_t = QFont("Segoe UI", 8)
+        painter.setFont(font_t)
+        fm_t = QFontMetrics(font_t)
+        t0 = int(left_ts_ep) - (int(left_ts_ep) % step_t)
+        prev_right = None
+        for t in range(t0, int(right_ts_ep) + 1, step_t):
+            xf = self._x_for(datetime.datetime.fromtimestamp(t), left_ts, right_ts)
+            if xf < -0.02 or xf > 1.02:
+                continue
+            x = pl + pw * xf
+            painter.setPen(QPen(GRID_CLR, 0.8, Qt.SolidLine))
+            painter.drawLine(QPointF(x, pt), QPointF(x, pt + ph))
+            if abs(t - now.timestamp()) < step_t / 2:
+                lbl_t = "NOW"
+                painter.setPen(QPen(QColor(0xC0, 0x39, 0x2B)))
+            elif step_t < 60:
+                lbl_t = datetime.datetime.fromtimestamp(t).strftime("%H:%M:%S")
+                painter.setPen(QPen(TEXT_DARK))
+            else:
+                lbl_t = datetime.datetime.fromtimestamp(t).strftime("%H:%M")
+                painter.setPen(QPen(TEXT_DARK))
+            lw = fm_t.horizontalAdvance(lbl_t)
+            lx = x - lw / 2
+            if prev_right is not None and lx < prev_right + 8:
+                continue
+            painter.drawText(QPointF(lx, pt + ph + fm_t.height() + 3), lbl_t)
+            prev_right = lx + lw
+
+        # Slim "NOW" reference line at the current instant (center in LIVE).
+        now_xf = self._x_for(now, left_ts, right_ts)
+        now_x = pl + pw * now_xf
+        painter.setPen(QPen(QColor(0xD4, 0x7B, 0x0F, 120), 1.0, Qt.DotLine))
+        painter.drawLine(QPointF(now_x, pt), QPointF(now_x, pt + ph))
 
         # Axis titles.
         painter.setPen(QPen(TEXT_MID))
         title_font = QFont("Segoe UI", 8, QFont.Bold)
         painter.setFont(title_font)
         fmtt = QFontMetrics(title_font)
-        xcap = "min before now"
-        painter.drawText(QPointF(pl + pw / 2 - fmtt.horizontalAdvance(xcap) / 2, h - 5), xcap)
+        painter.drawText(QPointF(pl + pw / 2 - fmtt.horizontalAdvance("TIME") / 2, h - 5), "TIME")
+        y_title = f"BLOCK POSITION ({self.unit})"
         painter.save()
         painter.translate(12, pt + ph / 2)
         painter.rotate(-90)
-        painter.drawText(QPointF(-fmtt.horizontalAdvance("Position (ft)") / 2, 0), "Position (ft)")
+        painter.drawText(QPointF(-fmtt.horizontalAdvance(y_title) / 2, 0), y_title)
         painter.restore()
 
-        # Trace (trace color), clipped to the plot frame.
+        # Trace (converted only for pixel placement; internal feet untouched).
         painter.setClipRect(pl, pt, pw + 1, ph + 1)
-        t0 = (pts[0][0] - cutoff).total_seconds()
-        t_end = (now - cutoff).total_seconds()
-        denom = max(t_end - t0, 1e-6)
         painter.setPen(QPen(self.color, 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         path = QPainterPath()
         first = True
-        for ts, val in pts:
-            xf = (ts - cutoff).total_seconds() / denom
+        for ts, raw_val in pts:
+            xf = self._x_for(ts, left_ts, right_ts)
             x = pl + pw * min(max(xf, 0.0), 1.0)
-            y_frac = (val - v_min) / span
-            y = pt + ph * (1.0 - y_frac)
-            y = max(pt, min(pt + ph, y))
+            y = self._y_px(raw_val * cf, lo, hi, pt, ph)
             if first:
                 path.moveTo(x, y)
                 first = False
@@ -494,9 +679,69 @@ class _IndustrialTrendGraph(QWidget):
         painter.drawPath(path)
         painter.setClipping(False)
 
+        # CURRENT-position tag (top-right inside the plot) + end dot.
+        last_val = vals[-1]
+        last_xf = self._x_for(pts[-1][0], left_ts, right_ts)
+        dot_x = pl + pw * min(max(last_xf, 0.0), 1.0)
+        dot_y = self._y_px(vals[-1], lo, hi, pt, ph)
+        painter.setBrush(QBrush(self.color))
+        painter.setPen(QPen(Qt.white, 1.5))
+        painter.drawEllipse(QPointF(dot_x, dot_y), 4, 4)
+        tag_font = QFont("Segoe UI", 8, QFont.Bold)
+        painter.setFont(tag_font)
+        fm_b = QFontMetrics(tag_font)
+        tag = f"CURRENT  {last_val:.2f} {self.unit}"
+        tag_w = fm_b.horizontalAdvance(tag)
+        tag_x = pl + pw - tag_w - 4
+        if tag_x > pl:
+            painter.setPen(QPen(TEXT_DARK))
+            painter.drawText(QPointF(tag_x, pt + 3 + fm_b.ascent()), tag)
+
+        # PAUSED VIEW tag (top-left inside the plot) when the view is frozen.
+        if self.paused:
+            paused_font = QFont("Segoe UI", 8, QFont.Bold)
+            painter.setFont(paused_font)
+            fm_p = QFontMetrics(paused_font)
+            painter.setPen(QPen(QColor(0xD4, 0x7B, 0x0F)))
+            painter.drawText(QPointF(pl + 4, pt + 3 + fm_p.ascent()), "PAUSED VIEW")
+
+        # Hover data inspection (Time + Position), never blocks live updates.
+        if self._hover_ts is not None and self._hover_val is not None:
+            hval = self._hover_val * cf
+            hf = self._x_for(self._hover_ts, left_ts, right_ts)
+            hx = pl + pw * min(max(hf, 0.0), 1.0)
+            hy = self._y_px(hval, lo, hi, pt, ph)
+            painter.setPen(QPen(QColor(0x80, 0x80, 0x80, 160), 1, Qt.DashLine))
+            painter.drawLine(QPointF(hx, pt), QPointF(hx, pt + ph))
+            painter.setBrush(QBrush(self.color))
+            painter.setPen(QPen(Qt.white, 1.5))
+            painter.drawEllipse(QPointF(hx, hy), 4, 4)
+            lines = [
+                f"Time:  {self._hover_ts.strftime('%H:%M:%S')}",
+                f"Position: {hval:.2f} {self.unit}",
+            ]
+            tip_font = QFont("Segoe UI", 8)
+            painter.setFont(tip_font)
+            fm_tip = QFontMetrics(tip_font)
+            line_h = fm_tip.height() + 2
+            max_w = max(fm_tip.horizontalAdvance(l) for l in lines)
+            pad = 6
+            tip_w = max_w + pad * 2
+            tip_h = line_h * len(lines) + pad * 2
+            tx = hx + 10
+            ty = max(pt, min(pt + ph - tip_h, hy - tip_h // 2))
+            if tx + tip_w > pl + pw:
+                tx = hx - tip_w - 10
+            painter.setBrush(QBrush(QColor(0xFF, 0xFF, 0xFA, 230)))
+            painter.setPen(QPen(BORDER, 1))
+            painter.drawRoundedRect(QRectF(tx, ty, tip_w, tip_h), 4, 4)
+            painter.setPen(QPen(TEXT_DARK))
+            for k, line in enumerate(lines):
+                painter.drawText(QPointF(tx + pad, ty + pad + fm_tip.ascent() + k * line_h), line)
+
         # Plot frame on top.
         painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(0x44, 0x44, 0x44), 1.2))
+        painter.setPen(QPen(frame, 1.2))
         painter.drawRect(pl, pt, pw, ph)
 
 

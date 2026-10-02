@@ -51,6 +51,8 @@ class DiagnosticsTab(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; } "
             "QScrollArea > QWidget > QWidget { background: transparent; }")
@@ -84,9 +86,9 @@ class DiagnosticsTab(QWidget):
             ("currentTicks", "Counter (raw ticks)", "internal measurement value"),
             ("blockPositionFt", "Block position (ft)", "firmware-reported (authoritative)"),
             ("velocityFtMin", "Velocity (ft/min)", "firmware-reported"),
-            ("direction", "Direction", "UP | DOWN | ON BOTTOM | STOPPED (firmware)"),
+            ("direction", "Direction", "UP | DOWN (tick-derived)"),
             ("onBottom", "On bottom", "stopped near the lowest calibrated anchor"),
-            ("currentLayer", "Current layer", "decided by firmware from calibration anchors"),
+            ("currentLayer", "Current wraps", "decided by firmware from calibration anchors"),
         ])
         root.addWidget(gb)
 
@@ -159,15 +161,18 @@ class DiagnosticsTab(QWidget):
         k = QLabel(label + ":")
         k.setStyleSheet(
             f"color:{TEXT_MID.name()}; font-family:'Segoe UI'; font-size:12px;")
-        k.setFixedWidth(230)
+        k.setMinimumWidth(170)
+        k.setWordWrap(True)
         v = QLabel("--")
         v.setStyleSheet(
             f"color:{TEXT_DARK.name()}; font-family:'Segoe UI'; font-size:12px; "
             f"font-weight:bold;")
+        v.setWordWrap(True)
         self._kv_value_widgets.append(v)
         n = QLabel(note)
         n.setStyleSheet(
             f"color:{TEXT_MID.name()}; font-family:'Segoe UI'; font-size:10px;")
+        n.setWordWrap(True)
         l.addWidget(k)
         l.addWidget(v, 1)
         l.addWidget(n)
@@ -221,9 +226,9 @@ class DiagnosticsTab(QWidget):
         cards = mw.device or {}
         pts = mw.cal_points()  # sorted [(counter, posFt), ...] authoritative
         self.set_value("audit_title",
-                       f"{int(mw.current_ticks):,} pulses → "
-                       f"{mw.block_position_ft:,.4f} ft  "
-                       f"({(mw.direction or 'STOPPED').upper()})")
+                       f"{int(mw.current_ticks):} pulses → "
+                       f"{mw.block_position_ft:.4f} ft  "
+                       f"({(mw.direction or 'DOWN').upper()})")
         # Exactly one interval label per interval position (indicating whether
         # two consecutive anchors exist for it).
         for idx, item in enumerate(self._calc_audit_items):
@@ -233,12 +238,21 @@ class DiagnosticsTab(QWidget):
                 pdiff = c2 - c1
                 fdiff = f2 - f1
                 ppf = (pdiff / fdiff) if abs(fdiff) > 1e-9 else float("nan")
-                self.set_value(f"audit_lower_p{span}", f"{c1:,} / {f1:.4f} ft")
-                self.set_value(f"audit_upper_p{span}", f"{c2:,} / {f2:.4f} ft")
-                self.set_value(f"audit_pdiff{span}", f"{pdiff:,}")
+                # Header: the interval's own pulse & foot span (was left at the
+                # "--" placeholder because no set_value call ever filled it).
+                self.set_value(f"audit_h{span}",
+                               f"{c1:} → {c2:} pulses  ·  "
+                               f"{f1:.4f} → {f2:.4f} ft  "
+                               f"(Δ {pdiff:} / {fdiff:.4f} ft)")
+                self.set_value(f"audit_lower_p{span}", f"{c1:} / {f1:.4f} ft")
+                self.set_value(f"audit_upper_p{span}", f"{c2:} / {f2:.4f} ft")
+                self.set_value(f"audit_pdiff{span}", f"{pdiff:}")
                 self.set_value(f"audit_fdiff{span}", f"{fdiff:.4f} ft")
                 self.set_value(f"audit_ppf{span}", f"{ppf:.6f} pulses/ft" if abs(fdiff) > 1e-9 else "--")
             else:
+                self.set_value(f"audit_h{span}",
+                               "no anchors for this interval "
+                               "(needs 2 confirmed calibration points)")
                 self.set_value(f"audit_lower_p{span}", "--")
                 self.set_value(f"audit_upper_p{span}", "--")
                 self.set_value(f"audit_pdiff{span}", "--")
@@ -246,7 +260,7 @@ class DiagnosticsTab(QWidget):
                 self.set_value(f"audit_ppf{span}", "--")
         pos = mw.calibrated_position()
         self.set_value("audit_pos",
-                       (f"{pos:,.6f} ft" if pos is not None
+                       (f"{pos:.6f} ft" if pos is not None
                         else "OUT OF RANGE / NO CALIBRATION"))
         _ = cards
 
@@ -290,23 +304,23 @@ class DiagnosticsTab(QWidget):
         self.set_value("calInRange", f"{int(mw.cal_in_range or 0)}")
         for i in range(1, 5):
             self.set_value(f"calPosition{i}",
-                           f(f"{dev.get(f'calPosition{i}', 0.0):,.4f}"))
+                           f(f"{dev.get(f'calPosition{i}', 0.0):.4f}"))
             self.set_value(f"calCounter{i}",
-                           f(f"{int(dev.get(f'calCounter{i}', 0) or 0):,}"))
+                           f(f"{int(dev.get(f'calCounter{i}', 0) or 0):}"))
         self.set_value("countsPerFoot1",
-                       f(f"{dev.get('countsPerFoot1', 0.0):,.4f}"))
+                       f(f"{dev.get('countsPerFoot1', 0.0):.4f}"))
         self.set_value("countsPerFoot2",
-                       f(f"{dev.get('countsPerFoot2', 0.0):,.4f}"))
+                       f(f"{dev.get('countsPerFoot2', 0.0):.4f}"))
         self.set_value("countsPerFoot3",
-                       f(f"{dev.get('countsPerFoot3', 0.0):,.4f}"))
+                       f(f"{dev.get('countsPerFoot3', 0.0):.4f}"))
         self.set_value("witsCorrectionFt",
-                       f(f"{dev.get('witsCorrectionFt', 0.0):,.4f}"))
-        self.set_value("currentTicks", f"{int(mw.current_ticks):,}")
-        self.set_value("blockPositionFt", f"{mw.block_position_ft:,.4f}")
-        self.set_value("velocityFtMin", f"{mw.velocity_ft_min:,.2f}")
-        self.set_value("direction", (mw.direction or "STOPPED").upper())
+                       f(f"{dev.get('witsCorrectionFt', 0.0):.4f}"))
+        self.set_value("currentTicks", f"{int(mw.current_ticks):}")
+        self.set_value("blockPositionFt", f"{mw.block_position_ft:.4f}")
+        self.set_value("velocityFtMin", f"{mw.velocity_ft_min:.2f}")
+        self.set_value("direction", (mw.direction or "DOWN").upper())
         self.set_value("onBottom", "YES" if mw.on_bottom else "NO")
-        self.set_value("currentLayer", f"{int(mw.current_layer or 1)}")
+        self.set_value("currentLayer", f"{int(mw.current_layer)}")
 
         # promt3 §22 — dashboard-verified calculation audit (math verification only)
         self._refresh_calc_audit()

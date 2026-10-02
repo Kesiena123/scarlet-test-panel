@@ -195,7 +195,7 @@ def main():
                    or "USER-DEFINED PULSES" in block_tab)
                   and ("POSITION (FT)" in block_tab or "USER FEET" in block_tab
                        or "USER-DEFINED FEET" in block_tab)
-                  and ("SET LAYER" in block_tab or "Set Layer" in block_tab)) \
+                  and ("SET WRAP" in block_tab or "Set wrap" in block_tab)) \
                 and ("set_calibration_point" in cmds)
             status, ev = ("PASS", "editable counts/position table (1..4) -> set_calibration_point") if ok else \
                 ("FAIL", "missing layers UI or command")
@@ -224,10 +224,10 @@ def main():
             ok = search(sproto, "clear_calibration_point") \
                  and search(enc_cpp, "encoder_clear_calibration_point") \
                  and search(cmds, "clear_calibration_point") \
-                 and search(block_tab, "DELETE LEVEL", "_on_delete_level")
-            status, ev = ("PASS", "clear_calibration_point (one level) separate from RESET COUNTER; "
-                                  "live counter unaffected; dashboard DELETE LEVEL wired") if ok else \
-                ("FAIL", "delete-level missing on firmware or dashboard")
+                 and search(block_tab, "DELETE WRAP", "_on_delete_level")
+            status, ev = ("PASS", "clear_calibration_point (one wrap) separate from RESET COUNTER; "
+                                  "live counter unaffected; dashboard DELETE WRAP wired") if ok else \
+                ("FAIL", "delete-wrap missing on firmware or dashboard")
         elif name == "Physical reset works":
             status = "NOT VERIFIED"
             ev = ["operator sign-off required (real button press)"]
@@ -279,7 +279,7 @@ def main():
                 ("FAIL", "direction / on-bottom logic missing")
         elif name == "Position graph works":
             ok = ("TREND" in block_tab) and ("_IndustrialTrendGraph" in block_tab) and ("position_history" in main_py)
-            status, ev = ("PASS", "live position-vs-time industrial graph fed by position_history") if ok else \
+            status, ev = ("PASS", "live position-vs-time industrial graph fed by the sampled live position buffer") if ok else \
                 ("FAIL", "position graph missing/unwired")
         elif name == "Power-cycle configuration retention":
             status = "NOT VERIFIED"

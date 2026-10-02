@@ -1,0 +1,622 @@
+Time-Based Slip Window for Block Position Tab
+
+Task: Add a Slip Window Load (k-lb) and Slip Window Time (seconds) control to the existing Block Position tab. Integrate the new logic into the existing Block Position, Bit Position, Hookload, and String Length calculation system without breaking any existing functionality, calculations, UI components, calibration, Demo/Live mode, or Arduino communication.
+
+1. NEW SLIP WINDOW INPUTS
+
+Add two Engineer-configurable inputs to the existing Block Position tab:
+
+Slip Window Load
+
+Unit:
+
+k-lb
+
+Example:
+
+Slip Window Load = 20 k-lb
+Slip Window Time
+
+Unit:
+
+seconds
+
+Example:
+
+Slip Window Time = 5 seconds
+
+Both values must be validated, saved using the application's existing settings/calibration storage system, and restored when the application restarts.
+
+Operators must be view-only. Only the Engineer role can modify these values, following the existing RBAC behavior.
+
+2. PRIMARY SLIP WINDOW RULE
+
+The Slip Window Load is the Hookload threshold that determines when the Slip Window confirmation timer is allowed to start.
+
+If:
+Hookload < Slip Window Load
+
+then:
+
+Bit Position must remain constant.
+
+No Slip Window timer should be considered confirmed.
+
+If:
+Hookload ≥ Slip Window Load
+
+then:
+
+Start the Slip Window confirmation timer.
+
+The timer must verify that the Hookload remains at or above the configured Slip Window Load for the entire configured time.
+
+3. SLIP WINDOW TIMER
+
+Example settings:
+
+Slip Window Load = 20 k-lb
+Slip Window Time = 5 seconds
+
+When:
+
+Hookload = 10 k-lb
+
+because:
+
+10 < 20
+
+the Slip Window timer must not activate.
+
+Bit Position remains constant.
+
+When Hookload reaches:
+
+20 k-lb
+
+the condition becomes true:
+
+Hookload ≥ Slip Window Load
+
+The system must immediately start the Slip Window timer:
+
+00.0 s → 00.1 s → 00.2 s → ... → 05.0 s
+
+During this confirmation period, the system must continuously monitor Hookload.
+
+4. TIMER CONFIRMATION REQUIREMENT
+
+The Slip Window is only confirmed if:
+
+Hookload ≥ Slip Window Load
+
+continuously for the entire configured Slip Window Time.
+
+For example:
+
+Slip Window Load = 20 k-lb
+Slip Window Time = 5 seconds
+Valid confirmation:
+Hookload:
+20 → 21 → 22 → 21 → 23 k-lb
+
+As long as every valid reading remains:
+
+≥ 20 k-lb
+
+the timer continues.
+
+After 5 continuous seconds:
+
+SLIP WINDOW CONFIRMED
+
+5. TIMER CANCELLATION
+
+If Hookload drops below the Slip Window Load before the timer finishes, the confirmation must be cancelled.
+
+Example:
+
+Slip Window Load = 20 k-lb
+Slip Window Time = 5 seconds
+
+Hookload:
+
+20 k-lb → Timer starts
+21 k-lb
+22 k-lb
+23 k-lb
+19 k-lb → condition failed
+
+At 19 k-lb:
+
+19 < 20
+
+Therefore:
+
+Cancel the timer.
+Reset the timer to 0.
+Slip Window remains NOT CONFIRMED.
+Bit Position must remain constant.
+Do not apply loaded Bit Position movement.
+
+If Hookload later returns to:
+
+≥ 20 k-lb
+
+start a new confirmation timer from zero.
+
+Do not continue the previous partially completed timer.
+
+6. AFTER SUCCESSFUL CONFIRMATION
+
+Once:
+
+Hookload ≥ Slip Window Load
+
+has remained true continuously for the complete Slip Window Time:
+
+Slip Window = CONFIRMED
+
+At that exact moment, the Bit Position calculation becomes active.
+
+The Bit Position must then immediately respond to Block Position movement.
+
+7. BIT POSITION MOVEMENT AFTER CONFIRMATION
+
+After Slip Window confirmation:
+
+If Block Position increases:
+
+Bit Position decreases by the same actual distance.
+
+Block ↑
+Bit ↓
+If Block Position decreases:
+
+Bit Position increases by the same actual distance.
+
+Block ↓
+Bit ↑
+
+Use the actual Block Position delta.
+
+Formula:
+Block Delta = Current Block Position − Previous Block Position
+
+Then:
+
+Bit Delta = −Block Delta
+
+Therefore:
+
+New Bit Position = Previous Bit Position − Block Delta
+8. COMPLETE EXAMPLE — HOOKLOAD BELOW SLIP WINDOW
+
+Settings:
+
+Slip Window Load = 20 k-lb
+Slip Window Time = 5 seconds
+
+Initial condition:
+
+Hookload = 10 k-lb
+Bit Position = 0 ft
+Block Position = 0 ft
+
+Because:
+
+10 < 20
+
+the Slip Window is not active.
+
+Bit Position remains:
+
+0 ft
+
+Now Block Position increases:
+
+0 → 100 ft
+
+Because Slip Window has not been confirmed:
+
+Bit Position = 0 ft
+
+String Length:
+
+String Length = Bit Position + Block Position
+              = 0 + 100
+              = 100 ft
+9. COMPLETE EXAMPLE — HOOKLOAD REACHES SLIP WINDOW
+
+Now Hookload increases:
+
+10 → 15 → 18 → 20 k-lb
+
+When:
+
+Hookload = 20 k-lb
+
+the condition becomes:
+
+Hookload ≥ Slip Window Load
+20 ≥ 20
+
+Start:
+
+Slip Window Timer = 0 seconds
+Slip Window Status = CONFIRMING
+
+The timer runs for the configured 5 seconds.
+
+10. EXAMPLE — TIMER FAILS
+
+Suppose:
+
+Slip Window Load = 20 k-lb
+Slip Window Time = 5 seconds
+
+Hookload:
+
+20 k-lb
+21 k-lb
+22 k-lb
+21 k-lb
+19 k-lb
+
+At 19 k-lb:
+
+19 < 20
+
+Therefore:
+
+Timer = RESET
+Status = NOT CONFIRMED
+Bit Position = CONSTANT
+
+The Block Position must not start affecting Bit Position merely because the timer had previously started.
+
+11. EXAMPLE — TIMER SUCCESSFULLY CONFIRMS
+
+Suppose:
+
+Slip Window Load = 20 k-lb
+Slip Window Time = 5 seconds
+
+Hookload remains:
+
+20 k-lb or higher
+
+for the entire 5 seconds.
+
+At:
+
+5.0 seconds
+
+set:
+
+Slip Window Status = CONFIRMED
+
+Then immediately enable the Bit Position movement calculation.
+
+12. COMPLETE BIT POSITION EXAMPLE AFTER CONFIRMATION
+
+Suppose before confirmation:
+
+Bit Position = 0 ft
+Block Position = 100 ft
+
+After the Slip Window is successfully confirmed, Block Position decreases:
+
+100 → 80 ft
+
+Calculate:
+
+Block Delta = 80 − 100
+            = −20 ft
+
+Therefore:
+
+Bit Delta = −(−20)
+          = +20 ft
+
+New Bit Position:
+
+0 − (−20)
+= 20 ft
+
+Result:
+
+Bit Position = 20 ft
+Block Position = 80 ft
+
+String Length:
+
+20 + 80 = 100 ft
+13. BLOCK POSITION CONTINUES DOWN
+
+Block then moves:
+
+80 → 50 ft
+
+Calculate:
+
+Block Delta = 50 − 80
+            = −30 ft
+
+Therefore:
+
+Bit Delta = +30 ft
+
+New Bit Position:
+
+20 + 30
+= 50 ft
+
+Result:
+
+Bit Position = 50 ft
+Block Position = 50 ft
+String Length = 100 ft
+14. BLOCK POSITION REVERSES DIRECTION
+
+If the Block now moves upward:
+
+50 → 70 ft
+
+Calculate:
+
+Block Delta = 70 − 50
+            = +20 ft
+
+Therefore:
+
+Bit Delta = −20 ft
+
+New Bit Position:
+
+50 − 20
+= 30 ft
+
+String Length:
+
+30 + 70
+= 100 ft
+
+Therefore the relationship remains consistent:
+
+Block Position + Bit Position = String Length
+
+15. IMPORTANT — SLIP WINDOW CONFIRMATION MUST NOT RESET BIT POSITION
+
+Once Bit Position has accumulated, a temporary Hookload drop below the Slip Window Load must not automatically erase or reset the Bit Position.
+
+Example:
+
+Bit Position = 100 ft
+
+Hookload falls below:
+
+Slip Window Load = 20 k-lb
+
+The system should:
+
+Stop/exit the confirmed loaded state according to the defined state machine.
+Prevent further loaded Bit Position movement while below the threshold.
+Preserve the existing Bit Position at 100 ft.
+Never reset it to zero.
+
+If Hookload later returns to ≥ Slip Window Load and successfully passes the confirmation timer again, Bit Position continues from the previously preserved value.
+
+16. STATE MACHINE
+
+Implement the Slip Window using explicit states:
+
+STATE 1 — BELOW WINDOW
+Hookload < Slip Window Load
+
+Status:
+
+NOT ACTIVE
+
+Action:
+
+Bit Position = CONSTANT
+Timer = 0
+STATE 2 — CONFIRMING
+Hookload ≥ Slip Window Load
+
+Status:
+
+CONFIRMING
+
+Action:
+
+Start timer
+Monitor Hookload continuously
+
+If Hookload falls below the threshold:
+
+CONFIRMING → NOT ACTIVE
+Timer → 0
+Bit Position → CONSTANT
+STATE 3 — CONFIRMED
+
+If:
+
+Hookload ≥ Slip Window Load
+
+continuously for the complete configured time:
+
+CONFIRMING → CONFIRMED
+
+Action:
+
+Immediately enable Bit Position movement.
+
+STATE 4 — CONFIRMED BUT LOAD LOST
+
+If a confirmed system later detects:
+
+Hookload < Slip Window Load
+
+the application must leave the confirmed state according to the defined state transition and preserve the current Bit Position.
+
+If Hookload rises again above the threshold, the confirmation timer must run again before Bit Position movement is re-enabled.
+
+17. STRING LENGTH
+
+Continue using:
+
+String Length = Bit Position + Block Position
+
+Do not create a separate String Length calculation for the Slip Window.
+
+Every time Bit Position or Block Position changes, String Length must be recalculated from the current values.
+
+18. USER INTERFACE
+
+Add a professional Slip Window section to the existing Block Position tab:
+
+┌──────────────────────────────────────────┐
+│              SLIP WINDOW                 │
+│                                          │
+│ Slip Window Load:  [ 20.00 ] k-lb        │
+│ Slip Window Time:  [ 5.00  ] sec         │
+│                                          │
+│ Status:       CONFIRMED                  │
+│ Timer:        5.00 / 5.00 sec            │
+└──────────────────────────────────────────┘
+
+The status should clearly display:
+
+NOT ACTIVE
+CONFIRMING
+CONFIRMED
+
+The timer should visibly count upward while confirmation is in progress.
+
+19. ENGINEER / OPERATOR ACCESS
+
+Follow the existing RBAC system.
+
+Operator
+Can view Slip Window Load.
+Can view Slip Window Time.
+Can view timer/status.
+Cannot modify the values.
+Engineer
+
+Can:
+
+Modify Slip Window Load.
+Modify Slip Window Time.
+Save the settings.
+Recalibrate/configure as permitted by the existing system.
+
+After the Engineer completes the modification, preserve the application's existing automatic return to Operator mode.
+
+20. CRITICAL IMPLEMENTATION REQUIREMENTS
+
+DO NOT:
+
+Reset Bit Position when the timer starts.
+Change Bit Position before Slip Window confirmation.
+Use the Slip Window Time as a distance calculation.
+Use a fixed Block Position increment.
+Add a fixed value to Bit Position.
+Ignore actual Block Position movement.
+Continue a partially completed timer after Hookload falls below the threshold.
+Reset Bit Position to zero when Hookload falls below the threshold.
+Create a second independent Hookload calculation system.
+Break existing calibration or encoder functionality.
+
+DO:
+
+Use the existing real-time Hookload value.
+Compare it directly with Slip Window Load.
+Start the timer when Hookload reaches/exceeds the threshold.
+Require continuous confirmation for the complete configured time.
+Reset the timer if Hookload falls below the threshold before confirmation.
+Activate Bit Position movement immediately after successful confirmation.
+Use actual Block Position delta for Bit Position.
+Preserve Bit Position when the Slip Window is not confirmed.
+Preserve accumulated Bit Position between cycles.
+Calculate String Length from:
+
+String Length = Bit Position + Block Position
+
+21. FINAL LOGIC
+
+The complete logic must be:
+
+IF Hookload < Slip Window Load
+    Slip Window = NOT ACTIVE
+    Timer = 0
+    Bit Position = CONSTANT
+
+ELSE IF Hookload >= Slip Window Load
+    Start Slip Window Timer
+
+    IF Hookload remains >= Slip Window Load
+       for the complete Slip Window Time
+
+        Slip Window = CONFIRMED
+        Enable Bit Position movement
+
+        Block Delta =
+            Current Block Position -
+            Previous Block Position
+
+        Bit Position =
+            Previous Bit Position -
+            Block Delta
+
+    ELSE
+        Cancel Timer
+        Reset Timer to 0
+        Bit Position = CONSTANT
+    END IF
+
+String Length =
+    Bit Position + Block Position
+Final example
+Slip Window Load = 20 k-lb
+Slip Window Time = 5 seconds
+
+At:
+
+Hookload = 10 k-lb
+
+→ below threshold
+→ Bit Position remains constant.
+
+At:
+
+Hookload = 20 k-lb
+
+→ timer starts.
+
+If Hookload remains ≥20 k-lb for 5 seconds:
+
+→ Slip Window CONFIRMED
+→ Bit Position movement becomes active immediately.
+
+Then:
+
+Block: 100 → 80 ft
+
+gives:
+
+Block Delta = -20 ft
+Bit increases by 20 ft
+
+While:
+
+Block: 80 → 100 ft
+
+gives:
+
+Block Delta = +20 ft
+Bit decreases by 20 ft
+
+The existing Block Position, Hookload, Bit Position, String Length, Encoder, calibration, Demo/Live mode, Arduino communication, and RBAC functionality must remain intact. Only add and integrate the Slip Window logic described above.

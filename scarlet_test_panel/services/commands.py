@@ -22,6 +22,15 @@ Protocol contract (must match encoder/serial_protocol.cpp + PROTOCOL.md):
       {"cmd":"load_calibration","req_id":8}                      -> IMMEDIATE
       {"cmd":"reset_counter","req_id":5}                         -> IMMEDIATE
 
+  16-CHANNEL ANALOG BANK (protocol 4.2):
+      {"cmd":"sensor_set_param","sensor":3,"param":"value_high",
+       "value":75.0,"req_id":11}                                 -> stage
+      {"cmd":"sensor_set_param","sensor":5,"param":"enabled",
+       "value":0.0,"req_id":14}  # disable a channel (UNUSED, never sampled)
+      {"cmd":"confirm","req_id":11}                              -> apply
+      {"cmd":"sensor_reset","sensor":4,"req_id":12}              -> IMMEDIATE
+      {"cmd":"sensor_factory_reset","req_id":13}                 -> IMMEDIATE
+
   RESPONSES (firmware -> dashboard), each ends with ",\"crc\":N}":
       {"type":"status","currentTicks":..,"blockPositionFt":..,
        "velocityFtMin":..,"direction":..,"calStatus":"..","calInRange":1,
@@ -176,6 +185,18 @@ class CommandTracker:
         value available until after the ack)."""
         return self._begin("load_calibration", {}, {}, on_done, on_fail)
 
+    def capture_tick(self, on_done, on_fail):
+        """Request the CURRENT encoder tick count from the Arduino (promt2).
+
+        Uses the firmware's `status` command — the reply's `currentTicks` IS the
+        Arduino's authoritative live counter; the dashboard never invents or
+        caches a tick of its own. Completed by on_status() when the status
+        reply arrives; fails on timeout / link loss / missing currentTicks so
+        the CAPTURE button can show "✕ CAPTURE FAILED" without touching the
+        layer input field.
+        """
+        return self._begin("status", {}, {}, on_done, on_fail)
+
     def reset_counter(self, on_done, on_fail):
         """Request an IMMEDIATE counter reset (promt1.txt).
 
@@ -186,19 +207,43 @@ class CommandTracker:
         """
         return self._begin("reset_counter", {}, {"currentTicks": 0}, on_done, on_fail)
 
-    def reset_feet(self, on_done, on_fail):
+    def reset_feet(self, start_ft=None, on_done=None, on_fail=None):
         """Request an IMMEDIATE RESET FEET (runtime position only).
 
-        Zeroes the live encoder counter, sets the block position reference to
-        0.00 ft, velocity to 0 and direction to STOPPED. Calibration anchors
-        are NEVER modified, re-based, saved or deleted by this command.
+        Zeroes the live encoder counter and establishes a NEW runtime position
+        reference. When `start_ft` is provided the block position is
+        re-referenced so it reads `start_ft` at the reset instant and tracks
+        movement relative to it; when omitted the classic 0.00 FT RESET FEET
+        applies. Calibration anchors are NEVER modified, re-based, saved or
+        deleted by this command.
         Success is declared ONLY when the firmware's `reset_feet_ack` reports
-        currentTicks == 0 AND blockPositionFt == 0.0 (the new zero reference).
+        currentTicks == 0 AND blockPositionFt == the requested reference.
         No CONFIRM step.
         """
-        return self._begin("reset_feet", {},
-                           {"currentTicks": 0, "blockPositionFt": 0.0},
-                           on_done, on_fail)
+        payload = {}
+        expected = {"currentTicks": 0}
+        if start_ft is not None:
+            payload["value"] = float(start_ft)
+            expected["blockPositionFt"] = float(start_ft)
+        else:
+            expected["blockPositionFt"] = 0.0
+        return self._begin("reset_feet", payload, expected, on_done, on_fail)
+
+    def sensor_set_param(self, sensor, param, value, on_done, on_fail):
+        """Stage a per-channel analog parameter update (protocol 4.2).
+
+        ``sensor`` is the 0-based channel index 0..15 (matches SENSOR_CONFIG
+        and the firmware array index; channel 0 = hookload chain is fixed and
+        will be rejected by the firmware). ``param`` is one of
+        voltage_low/voltage_high/value_low/value_high/min_eng/max_eng/gain/
+        offset/filter/enabled. With ``enabled`` set to 0.0 a channel becomes
+        UNUSED (firmware stops sampling it); 1.0 re-enables it.
+        Verified against the firmware's echoed ``value``.
+        """
+        return self._begin("sensor_set_param",
+                           {"sensor": int(sensor), "param": str(param),
+                            "value": float(value)},
+                           {"value": float(value)}, on_done, on_fail)
 
     # -- send --------------------------------------------------------------
     def _begin(self, cmd, payload, expected, on_done, on_fail):
@@ -266,13 +311,20 @@ class CommandTracker:
         """Handle a firmware `reset_ack` (immediate reset confirmation)."""
         req_id = int(data.get("req_id") or 0)
         req = self._pending.get(req_id)
+        if req is None:
+            # Older firmware acks omit req_id. Fall back to the single
+            # in-flight reset_counter request (at most one per operator action).
+            for r in self._pending.values():
+                if r.cmd == "reset_counter":
+                    req = r
+                    break
         if req is None or req.cmd != "reset_counter":
             return False
         # The only proof is the counter actually reading 0 (promt.txt §8).
         raw = data.get("currentTicks")
         if raw is not None and int(float(raw)) == 0:
             req.phase = ReqPhase.DONE
-            self._pending.pop(req_id, None)
+            self._pending.pop(req.req_id, None)
             if req.on_done:
                 try:
                     req.on_done(req, data)
@@ -285,20 +337,41 @@ class CommandTracker:
     def on_reset_feet_ack(self, data):
         """Handle a firmware `reset_feet_ack` (immediate RESET FEET confirm).
 
-        Success requires BOTH the counter reading 0 AND the reported block
-        position equal to the new 0.00 ft reference. Calibration is untouched.
+        Success requires the counter reading 0 AND the reported block
+        position equal to the requested reference (default 0.00 ft; any
+        user-supplied starting feet from the pending request, otherwise).
+        Calibration is untouched.
         """
         req_id = int(data.get("req_id") or 0)
         req = self._pending.get(req_id)
+        if req is None:
+            # Older firmware acks omit req_id. Match a pending reset_feet by
+            # the reported position vs its requested reference (within
+            # tolerance); a single pending reset_feet is expected.
+            raw_pos = data.get("blockPositionFt")
+            if raw_pos is not None:
+                try:
+                    posf = float(raw_pos)
+                except (TypeError, ValueError):
+                    posf = None
+                if posf is not None:
+                    for r in self._pending.values():
+                        if r.cmd == "reset_feet":
+                            want = float(r.expected.get("blockPositionFt", 0.0))
+                            if abs(posf - want) <= max(self._tol, abs(want) * self._tol):
+                                req = r
+                                break
         if req is None or req.cmd != "reset_feet":
             return False
         raw_ticks = data.get("currentTicks")
         raw_pos = data.get("blockPositionFt")
+        want = float(req.expected.get("blockPositionFt", 0.0))
         if (raw_ticks is not None and int(float(raw_ticks)) == 0
                 and raw_pos is not None
-                and abs(float(raw_pos)) <= max(self._tol, 0.0)):
+                and abs(float(raw_pos) - want)
+                    <= max(self._tol, abs(want) * self._tol)):
             req.phase = ReqPhase.DONE
-            self._pending.pop(req_id, None)
+            self._pending.pop(req.req_id, None)
             if req.on_done:
                 try:
                     req.on_done(req, data)
@@ -307,6 +380,30 @@ class CommandTracker:
             return "verified"
         self._finish_fail(req, "reset_feet_ack reported non-zero counter/position")
         return "failed"
+
+    def on_status(self, data):
+        """Handle a firmware `status` reply that completes a capture_tick().
+
+        The status reply carries the Arduino's authoritative currentTicks; the
+        pending "status" request is marked DONE and its on_done callback fires.
+        If the reply lacks currentTicks, the request fails so the caller shows
+        "✕ CAPTURE FAILED" without modifying any field.
+        """
+        req_id = int(data.get("req_id") or 0)
+        req = self._pending.get(req_id)
+        if req is None or req.cmd != "status":
+            return False
+        if "currentTicks" not in data:
+            self._finish_fail(req, "status reply carried no currentTicks")
+            return "failed"
+        req.phase = ReqPhase.DONE
+        self._pending.pop(req_id, None)
+        if req.on_done:
+            try:
+                req.on_done(req, data)
+            except Exception:
+                pass
+        return "verified"
 
     # -- timeout sweep ---------------------------------------------------
     def tick(self, now=None):

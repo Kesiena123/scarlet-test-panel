@@ -1,4 +1,9 @@
-"""Role-based access control and command sanitization.
+"""Role labels and command sanitization.
+
+ACCESS CONTROL: there is none. Any role may calibrate, reset/tare and issue
+device commands - the role is a display/audit label only. The privilege
+predicates on RoleManager (is_engineer/can_command/at_least) still exist and
+still return True, so every call site keeps working unchanged.
 
 SECURITY NOTE (TLS / exposure):
   This dashboard and firmware are intended for a LOCAL serial link only, on
@@ -8,8 +13,8 @@ SECURITY NOTE (TLS / exposure):
     1. Transport encryption (TLS 1.2+ / mTLS) for any network-exposed path,
     2. Authentication of every supervisor command on the firmware side,
     3. Binding of operator/supervisor privileges to authenticated identities.
-  Roles here are enforced only at the dashboard UI layer; they are not a
-  substitute for authenticated firmware command authorization.
+  Nothing here gates access, so it is not a substitute for authenticated
+  firmware command authorization.
 """
 
 __all__ = ["ROLE_OPERATOR", "ROLE_SUPERVISOR", "ROLE_ENGINEER",
@@ -19,23 +24,24 @@ ROLE_OPERATOR = "operator"
 ROLE_SUPERVISOR = "supervisor"
 ROLE_ENGINEER = "engineer"
 
-# Privilege ordering (higher = more privileged). Matches spec §23:
-#   OPERATOR  -> view dashboards, alarms, trends, events
-#   SUPERVISOR-> + reset/tare, calibrate, configure layers/params, export, diagnostics
-#   ENGINEER  -> + raw encoder info, advanced measurement params, comm diagnostics,
-#                firmware info, system parameters.
+# Valid role labels, kept for display/audit. They no longer carry privileges:
+# every role has full access (see RoleManager).
 _ROLE_ORDER = [ROLE_OPERATOR, ROLE_SUPERVISOR, ROLE_ENGINEER]
 
 
-def _rank(role):
-    try:
-        return _ROLE_ORDER.index(role)
-    except ValueError:
-        return 0
-
-
 class RoleManager:
-    """Three-tier role model (Operator < Supervisor < Engineer)."""
+    """Open-access model: every role has full access.
+
+    Calibration (and every other operator action) is available to anybody, so
+    the privilege predicates no longer gate anything - they are kept, with the
+    same names, signatures and return types, because the UI still calls them
+    (block position tab, sensor calibration dialog, analog monitor, sensors
+    tab, diagnostics tab, status bar).
+
+    The role is now a *display/audit label only*: `role()` reports the current
+    label and `set_role()` still changes it and notifies subscribers, so the
+    role indicator keeps working. Nothing is view-only any more.
+    """
 
     def __init__(self, initial_role=ROLE_OPERATOR):
         if initial_role not in _ROLE_ORDER:
@@ -47,18 +53,20 @@ class RoleManager:
         return self._role
 
     def is_supervisor(self):
-        """True for Supervisor or any higher role (i.e. can issue commands)."""
-        return _rank(self._role) >= _rank(ROLE_SUPERVISOR)
+        """Always True: no action is restricted to a higher role."""
+        return True
 
     def is_engineer(self):
-        return _rank(self._role) >= _rank(ROLE_ENGINEER)
+        """Always True: anybody may calibrate."""
+        return True
 
     def can_command(self):
-        """Alias of is_supervisor(): can issue device commands."""
-        return self.is_supervisor()
+        """Always True: anybody may issue device commands."""
+        return True
 
-    def at_least(self, role):
-        return _rank(self._role) >= _rank(role)
+    def at_least(self, role=None):
+        """Always True, for any requested role."""
+        return True
 
     def set_role(self, role):
         if role not in _ROLE_ORDER:

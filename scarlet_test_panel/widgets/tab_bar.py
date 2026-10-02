@@ -14,7 +14,7 @@ class TabBar(QWidget):
         for i, name in enumerate(tabs):
             btn = QPushButton(name)
             btn.setCheckable(True)
-            btn.setFixedHeight(38)
+            btn.setFixedHeight(26)
             btn.setMinimumWidth(140)
             btn.setCursor(Qt.PointingHandCursor)
             idx = i
@@ -57,6 +57,12 @@ class TabBar(QWidget):
 
     def on_change(self, callback):
         self._callbacks.append(callback)
+
+    def set_current(self, index):
+        """Select a tab programmatically (same path as a button click), so the
+        highlight and the on_change callback always stay in sync."""
+        if 0 <= index < len(self._btns):
+            self._select(index)
 
     def set_tab_visible(self, index, visible):
         """Show or hide a tab button without rebuilding the whole bar."""

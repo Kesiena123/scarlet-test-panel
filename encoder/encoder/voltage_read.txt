@@ -1,0 +1,541 @@
+INDEPENDENT 16-CHANNEL ANALOG INPUT SYSTEM
+
+Modify the existing Arduino Mega analog-monitoring implementation to provide true, independent, stable voltage readings for all 16 analog channels A0–A15.
+
+1. PRIMARY OBJECTIVE
+
+I am using an Arduino Mega with 16 analog input channels:
+
+A0
+A1
+A2
+A3
+A4
+A5
+A6
+A7
+A8
+A9
+A10
+A11
+A12
+A13
+A14
+A15
+
+Currently, a real sensor is connected to A0, while A1–A15 are not connected yet.
+
+The problem is that when the voltage on A0 changes, the displayed voltages on the unused channels also appear to change.
+
+I do NOT want the channels to depend on one another.
+
+Each analog channel must have its own independent ADC measurement and its own independent processing pipeline.
+
+2. IMPORTANT HARDWARE REQUIREMENT
+
+Implement the software assuming:
+
+A0 → Sensor 0
+A1 → Sensor 1
+A2 → Sensor 2
+...
+A15 → Sensor 15
+
+Each channel must be treated as a completely independent measurement.
+
+DO NOT copy A0's value to another channel.
+
+DO NOT calculate one channel from another channel.
+
+DO NOT use the previous channel's voltage as the current channel's voltage.
+
+Every channel must perform its own:
+
+ADC sampling
+      ↓
+raw ADC value
+      ↓
+voltage conversion
+      ↓
+filtering
+      ↓
+stability validation
+      ↓
+fault detection
+      ↓
+final channel voltage
+3. PREVENT ADC CHANNEL CROSS-TALK
+
+Implement proper Arduino Mega ADC channel switching.
+
+When changing from one analog channel to another:
+
+Select the new ADC channel.
+Allow the ADC multiplexer/input to settle.
+Perform and discard the first ADC conversion after switching channels.
+Perform multiple valid ADC samples from the selected channel.
+Average/filter only samples belonging to that channel.
+Store the final result in that channel's own variable.
+
+For example:
+
+Read A0
+↓
+settle
+↓
+discard first conversion
+↓
+sample A0 multiple times
+↓
+calculate A0 voltage
+
+Read A1
+↓
+settle
+↓
+discard first conversion
+↓
+sample A1 multiple times
+↓
+calculate A1 voltage
+
+Repeat independently through A15.
+
+Do not reuse the previous channel's ADC result.
+
+4. FLOATING INPUT HANDLING
+
+A1–A15 are currently physically unconnected.
+
+Do NOT display their floating ADC values as if they were real sensor measurements.
+
+An unconnected Arduino analog input is electrically floating and can produce arbitrary readings.
+
+Implement an appropriate channel state such as:
+
+UNCONNECTED
+NO SIGNAL
+INVALID
+
+rather than pretending the voltage is a valid sensor measurement.
+
+If the existing system has a sensor configuration for each channel, use that configuration to determine whether the channel is enabled.
+
+For unused channels:
+
+Channel enabled = FALSE
+Status = UNUSED
+Voltage = 0.000 V or "---"
+
+Do not allow an unused floating input to appear as a real sensor signal.
+
+5. INDEPENDENT VARIABLES
+
+Create a dedicated data structure/variable set for every channel.
+
+Conceptually:
+
+channel[0]
+channel[1]
+channel[2]
+...
+channel[15]
+
+Each channel must independently contain information such as:
+
+rawADC
+rawVoltage
+filteredVoltage
+calibratedVoltage
+status
+enabled
+stable
+fault
+
+Do not create one global voltage variable that is repeatedly overwritten and then reused incorrectly by all 16 channels.
+
+6. FILTERING
+
+The real sensor voltage may contain small electrical fluctuations.
+
+Implement a professional noise-filtering method such as:
+
+multiple ADC samples per reading
+averaging/oversampling
+moving average or exponential filtering
+optional stability detection
+
+The filtering must reduce electrical noise without artificially forcing the value to a fixed voltage.
+
+For example, if the real input is approximately:
+
+2.48 V
+2.49 V
+2.48 V
+2.50 V
+2.49 V
+
+the displayed value should remain around:
+
+2.49 V
+
+Do NOT create a filter that makes every reading jump between predefined calibration values.
+
+7. DO NOT USE BLIND ADC-TO-VOLTAGE CONVERSION
+
+Do not blindly assume that the Arduino Mega ADC reference is exactly 5.000 V.
+
+Use the existing ADC reference architecture if already implemented.
+
+If the application supports voltage calibration, use:
+
+Corrected Voltage =
+(Raw Measured Voltage × Gain) + Offset
+
+Keep these values independently configurable.
+
+The system must retain access to:
+
+Raw ADC
+Raw Voltage
+Calibrated Voltage
+
+for diagnostics.
+
+8. HOOKLOAD / 4–20 mA CHANNEL
+
+A0 is currently being used for the real sensor.
+
+For the hookload 4–20 mA signal using the precision burden resistor:
+
+4 mA  ≈ 1 V
+20 mA ≈ 5 V
+
+when using:
+
+250 Ω
+
+burden resistance.
+
+The software must read the actual voltage measured at A0.
+
+Do not simply assume that the sensor is always exactly 1–5 V.
+
+The actual measured voltage must be used by the hookload calculation and calibration system.
+
+9. CHANNEL ISOLATION IN SOFTWARE
+
+Every channel must have its own independent processing.
+
+For example:
+
+A0 → channel[0]
+A1 → channel[1]
+A2 → channel[2]
+...
+A15 → channel[15]
+
+Changing A0 from:
+
+1.50 V → 3.50 V
+
+must NOT cause A1–A15 to change unless there is an actual electrical signal present on those channels.
+
+The software must never intentionally synchronize the channels.
+
+10. SCAN SEQUENCE
+
+Implement a controlled scanning sequence:
+
+A0
+↓
+A1
+↓
+A2
+↓
+A3
+↓
+A4
+↓
+A5
+↓
+A6
+↓
+A7
+↓
+A8
+↓
+A9
+↓
+A10
+↓
+A11
+↓
+A12
+↓
+A13
+↓
+A14
+↓
+A15
+↓
+repeat
+
+Do not use unnecessary delay() calls that freeze the monitoring system.
+
+Use a non-blocking timing architecture where possible so that:
+
+serial communication
+sensor monitoring
+alarm processing
+UI communication
+calibration
+encoder processing
+hookload calculation
+
+continue working normally.
+
+11. SAMPLE QUALITY
+
+For each enabled channel:
+
+discard the first ADC conversion after channel switching
+take multiple ADC samples
+reject obviously invalid readings
+calculate a stable filtered value
+preserve sufficient resolution
+update the channel independently
+
+Do not over-filter the signal to the point that real sensor changes become slow or hidden.
+
+12. FAULT DETECTION
+
+Each channel must be capable of reporting its own state.
+
+Example:
+
+NORMAL
+UNUSED
+LOW SIGNAL
+HIGH SIGNAL
+UNSTABLE
+ADC ERROR
+SENSOR FAULT
+
+For a configured 1–5 V sensor channel:
+
+< 1 V
+
+may be treated as a low/out-of-range condition according to the existing sensor configuration.
+
+Similarly:
+
+> 5 V
+
+must not be converted into a believable sensor value.
+
+Use the existing sensor-specific limits where available instead of hard-coding 1–5 V for every sensor.
+
+13. IMPORTANT — DO NOT ALTER EXISTING CALCULATIONS
+
+Do not break or redesign existing:
+
+Hookload calculation
+4–20 mA conversion
+Voltage calibration
+Hookload calibration
+Block Position
+Bit Position
+String Length
+Slip Window
+Encoder
+Demo Mode
+Live Mode
+Serial communication
+PyQt5 communication
+Engineer/Operator RBAC
+Existing sensor calibration
+Existing dashboard
+Existing storage
+Existing alarm logic
+
+The objective is to improve the analog acquisition layer, not to replace existing application functionality.
+
+14. PYQT5 COMMUNICATION
+
+Send each channel's independently measured data using a clear channel identifier.
+
+Example concept:
+
+A0: 2.493V
+A1: 0.000V
+A2: 0.000V
+...
+A15: 0.000V
+
+or a structured format such as:
+
+{
+  "channel": 0,
+  "raw_adc": 510,
+  "voltage": 2.493,
+  "status": "NORMAL"
+}
+
+Use the existing serial protocol if one already exists.
+
+Do not break the existing PyQt5 communication protocol.
+
+If the current protocol already has a defined format, extend it carefully rather than replacing it.
+
+15. DIAGNOSTIC MODE
+
+Add a diagnostic capability showing for each channel:
+
+Channel
+Raw ADC
+Raw Voltage
+Filtered Voltage
+Calibrated Voltage
+Status
+
+This is important for commissioning and troubleshooting.
+
+Example:
+
+A0
+Raw ADC:          510
+Raw Voltage:      2.493 V
+Filtered Voltage: 2.490 V
+Status:           NORMAL
+
+The diagnostic screen must make it obvious whether a problem originates from:
+
+sensor
+wiring
+ADC
+reference voltage
+filtering
+calibration
+communication
+16. CRITICAL HARDWARE SAFETY CHECK
+
+Do not allow any Arduino Mega analog input to receive a voltage above the Arduino's permitted analog-input range.
+
+For the 4–20 mA hookload circuit, the Arduino must measure the voltage across the properly selected burden resistor.
+
+Never connect the 24 V sensor supply directly to an Arduino analog input.
+
+The actual industrial wiring, grounding, shielding, isolation/barrier requirements and sensor terminal polarity must be verified against the sensor's documentation and the installed oil-rig instrumentation system before field deployment.
+
+17. REAL OIL-RIG REQUIREMENT
+
+This is intended for a real industrial monitoring application.
+
+Therefore prioritize:
+
+Measurement independence
+Measurement integrity
+Stable ADC acquisition
+Fault detection
+Deterministic behavior
+Electrical-noise resistance
+Diagnostic visibility
+Calibration integrity
+Fail-safe behavior
+
+Do not optimize only for a visually smooth number.
+
+A smooth but incorrect value is unacceptable.
+
+The system must distinguish between:
+
+REAL SENSOR SIGNAL
+NO SIGNAL
+FLOATING INPUT
+NOISY SIGNAL
+OUT-OF-RANGE SIGNAL
+ADC/COMMUNICATION FAULT
+18. TEST PROCEDURE
+
+After implementation, verify the following:
+
+Test 1 — A0 only
+
+Connect the real sensor to A0.
+
+Change A0 through different voltages.
+
+Verify:
+
+A0 changes correctly
+A1–A15 do not follow A0
+Test 2 — Independent A1 test
+
+Connect a known stable voltage source to A1 while A0 remains connected.
+
+Verify:
+
+A0 = its own voltage
+A1 = its own voltage
+
+Changing A0 must not change A1.
+
+Test 3 — Multiple channels
+
+Apply different known voltages to several channels.
+
+Example:
+
+A0 = 1.00 V
+A1 = 2.00 V
+A2 = 3.00 V
+A3 = 4.00 V
+
+The system must report each channel independently.
+
+Test 4 — Unused channels
+
+Leave A4–A15 disconnected.
+
+They must be reported as:
+
+UNUSED / DISABLED
+
+rather than displaying random floating voltages as valid measurements.
+
+Test 5 — Stability
+
+Apply a stable voltage to A0 and monitor it continuously.
+
+The displayed voltage should remain stable within the expected electrical/ADC noise band without artificially locking the value.
+
+19. VERY IMPORTANT — PRESERVE EXISTING CODE
+
+DO NOT START THE PROJECT AGAIN FROM SCRATCH.
+
+First inspect the existing Arduino and PyQt5 code.
+
+Identify:
+
+existing ADC acquisition
+analog channel definitions
+sensor configuration
+calibration system
+serial protocol
+filtering
+dashboard data structures
+Demo/Live mode
+existing alarm/fault handling
+
+Then modify only the necessary sections.
+
+DO NOT DELETE WORKING FEATURES.
+
+DO NOT CHANGE EXISTING CALCULATION FORMULAS.
+
+DO NOT BREAK EXISTING SERIAL COMMUNICATION.
+
+DO NOT BREAK THE HOOKLOAD, ENCODER, BLOCK POSITION, BIT POSITION, STRING LENGTH OR SLIP WINDOW SYSTEM.
+
+The final implementation must provide 16 genuinely independent analog channels, with stable and traceable readings suitable for further industrial commissioning and validation.

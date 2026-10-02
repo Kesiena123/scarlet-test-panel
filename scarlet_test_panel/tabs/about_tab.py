@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 from .. import theme
-from ..config import BG_CARD, BG_INNER, BORDER, TEXT_DARK, TEXT_MID
+from ..config import BG_CARD, BG_INNER, BORDER, TEXT_DARK, TEXT_MID, TEXT_ON_DARK
 from ..services.settings import PANEL_DATA_DIR
 
 DASHBOARD_VERSION = "3.0.0"
@@ -38,7 +38,7 @@ class AboutTab(QWidget):
         theme_layout.addWidget(self._hint(
             "Theme is applied immediately. Persisted to settings.json."))
         self.theme_toggle = QComboBox()
-        self.theme_toggle.addItems(["Light", "Dark"])
+        self.theme_toggle.addItems(["Red", "Light", "Dark"])
         self.theme_toggle.setStyleSheet(
             f"QComboBox {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()}; "
             f"border:1px solid {BORDER.name()}; border-radius:6px; padding:4px; }}")
@@ -78,7 +78,7 @@ class AboutTab(QWidget):
         self.calstat_lbl = self._kv("Calibration status", "--")
         self.onbottom_lbl = self._kv("On bottom", "--")
         self.pos_lbl = self._kv("Current block position (ft)", "--")
-        self.layer_lbl = self._kv("Current layer", "--")
+        self.layer_lbl = self._kv("Current wraps", "--")
         cal_layout.addWidget(self.cal_status_lbl)
         cal_layout.addWidget(self.cal_l1_lbl)
         cal_layout.addWidget(self.cal_l2_lbl)
@@ -99,7 +99,7 @@ class AboutTab(QWidget):
         self._export_btns = [btn_csv, btn_pdf]
         for b in self._export_btns:
             b.setStyleSheet(
-                f"QPushButton {{ background:{BG_INNER.name()}; color:{TEXT_DARK.name()}; "
+                f"QPushButton {{ background:{BG_INNER.name()}; color:{TEXT_ON_DARK.name()}; "
                 f"border:1px solid {BORDER.name()}; border-radius:6px; padding:6px 12px; }} "
                 f"QPushButton:hover {{ background:{BORDER.name()}; }}")
         btn_csv.clicked.connect(lambda: self.mw.export_audit("csv"))
@@ -129,8 +129,10 @@ class AboutTab(QWidget):
         k = QLabel(key + ":")
         k.setStyleSheet(
             f"color:{t.color_name('TEXT_MID')}; font-family:'Segoe UI'; font-size:12px;")
-        k.setFixedWidth(160)
+        k.setMinimumWidth(140)
+        k.setWordWrap(True)
         v = QLabel(value)
+        v.setWordWrap(True)
         self._kv_value_widgets.append(v)
         l.addWidget(k)
         l.addWidget(v, 1)
@@ -150,18 +152,23 @@ class AboutTab(QWidget):
 
     # ── behaviour ────────────────────────────────────────────
     def _on_theme_changed(self, name):
-        selected = "dark" if name == "Dark" else "light"
-        self.mw.apply_theme(selected)
+        _MAP = {"Red": "red", "Light": "light", "Dark": "dark"}
+        self.mw.apply_theme(_MAP.get(name, "red"))
 
     def _restyle(self):
         """Re-apply theme tokens to every styled control in this surface."""
         t = theme.current()
+        _NAMES = {"red": "Red", "light": "Light", "dark": "Dark"}
+        idx = ("Red", "Light", "Dark").index(_NAMES.get(theme.current().name, "Red"))
+        self.theme_toggle.blockSignals(True)
+        self.theme_toggle.setCurrentIndex(idx)
+        self.theme_toggle.blockSignals(False)
         self.theme_toggle.setStyleSheet(
             f"QComboBox {{ background:{t.color_name('BG_CARD')}; color:{t.color_name('TEXT_DARK')}; "
             f"border:1px solid {t.color_name('BORDER')}; border-radius:6px; padding:4px; }}")
         for b in getattr(self, "_export_btns", []):
             b.setStyleSheet(
-                f"QPushButton {{ background:{t.color_name('BG_INNER')}; color:{t.color_name('TEXT_DARK')}; "
+                f"QPushButton {{ background:{t.color_name('BG_INNER')}; color:{t.color_name('TEXT_ON_DARK')}; "
                 f"border:1px solid {t.color_name('BORDER')}; border-radius:6px; padding:6px 12px; }} "
                 f"QPushButton:hover {{ background:{t.color_name('BORDER')}; }}")
         for v in getattr(self, "_kv_value_widgets", []):
@@ -215,17 +222,17 @@ class AboutTab(QWidget):
                 pos = dev.get(f"calPosition{i}", 0.0) or 0.0
                 ctr = int(dev.get(ct_lbl, 0) or 0)
                 self._label(w_lbl).setText(
-                    f"{pos:,.3f} ft / {ctr:,}")
+                    f"{pos:.3f} ft / {ctr:}")
             self._label(self.wits_lbl).setText(
-                f"{dev.get('witsCorrectionFt', 0.0):,.3f}")
+                f"{dev.get('witsCorrectionFt', 0.0):.3f}")
             self._label(self.calstat_lbl).setText(
                 getattr(mw, "cal_status", None) or "NO_CALIBRATION")
             self._label(self.onbottom_lbl).setText(
                 "YES" if getattr(mw, "on_bottom", False) else "NO")
             self._label(self.pos_lbl).setText(
-                f"{mw.block_position_ft:,.3f}")
-            layer_n = int(mw.current_layer or 1)
-            self._label(self.layer_lbl).setText(f"Layer {layer_n}")
+                f"{mw.block_position_ft:.3f}")
+            layer_n = int(mw.current_layer)
+            self._label(self.layer_lbl).setText(f"Wrap {layer_n}")
         else:
             self.cal_status_lbl.setText(
                 "NOT VERIFIED — awaiting device STATUS. Dashboard never shows "

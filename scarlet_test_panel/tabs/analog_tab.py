@@ -1,6 +1,6 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QGridLayout, QScrollArea, QFrame, QDialog, QComboBox,
+    QScrollArea, QFrame, QDialog, QComboBox,
     QDialogButtonBox, QMessageBox
 )
 from PyQt5.QtCore import Qt
@@ -10,6 +10,7 @@ from ..config import (
     BORDER, TEXT_MID, TEXT_LITE, TEXT_DARK, sensor_color  # <-- added TEXT_DARK
 )
 from ..widgets.cards import SensorPanel
+from ..widgets.flow_layout import FlowLayout
 from ..dialogs.calibration_dialog import VoltageCalibrationDialog
 
 
@@ -47,17 +48,24 @@ class AnalogTab(QWidget):
 
         self.grid_widget = QWidget()
         self.grid_widget.setStyleSheet("background: transparent;")
-        self.grid = QGridLayout(self.grid_widget)
+        self.grid = FlowLayout(owner=self.grid_widget)
         self.grid.setSpacing(10)
-        self.grid.setContentsMargins(0, 0, 0, 0)
-        for c in range(3):
-            self.grid.setColumnStretch(c, 1)
         scroll = QScrollArea()
         scroll.setWidget(self.grid_widget)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setStyleSheet("background: transparent; border: none;")
         root.addWidget(scroll, stretch=1)
+
+        # voltage_read.txt: every configured analog channel is on screen from the
+        # start (connected sensors show their live voltage, no-sensor channels a
+        # plain 0); the "+ Add" flow is therefore fully pre-populated.
+        for i in range(NUM_ANALOG):
+            self._ensure_panel(i)
+            self.panels[i].setVoltage(0.0)
+        self.add_btn.setEnabled(False)
 
     def _show_add_dialog(self):
         available = [i for i in range(NUM_ANALOG) if self.panels[i] is None]
@@ -78,7 +86,7 @@ class AnalogTab(QWidget):
         for i in available:
             combo.addItem(SENSOR_CONFIG[i]["name"], i)
         combo.setStyleSheet(f"""
-            QComboBox {{ background:{BG_INNER.name()}; color:{TEXT_DARK.name()}; border:1px solid {BORDER.name()};
+            QComboBox {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()}; border:1px solid {BORDER.name()};
                 border-radius:4px; font-family:'Georgia'; font-size:12px; padding:6px; }}
             QComboBox QAbstractItemView {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()}; }}
         """)
@@ -100,20 +108,20 @@ class AnalogTab(QWidget):
             dlg.move(pw.center() - dlg.rect().center())
         dlg.exec_()
 
-    def _on_calibrated(self, idx, name, cal_min, cal_max, band_lo, band_hi):
+    def _ensure_panel(self, idx):
         if self.panels[idx] is None:
             panel = SensorPanel(SENSOR_CONFIG[idx], sensor_color(idx),
-                                 calibrate_callback=lambda: self._open_calibration(idx))
+                                calibrate_callback=lambda: self._open_calibration(idx))
             self.panels[idx] = panel
-            row, col = divmod(self._count, 3)
-            self.grid.addWidget(panel, row, col)
+            self.grid.addWidget(panel)
             self._count += 1
             self.empty_lbl.hide()
             self.count_lbl.setText(f"{self._count} / {NUM_ANALOG} signals added")
-        else:
-            panel = self.panels[idx]
-            panel.setTitle(name)
+        return self.panels[idx]
 
+    def _on_calibrated(self, idx, name, cal_min, cal_max, band_lo, band_hi):
+        panel = self._ensure_panel(idx)
+        panel.setTitle(name)
         panel.updateCalibration(cal_min, cal_max)
         if band_lo is not None:
             panel.cal_gauge.setCalBand(band_lo, band_hi)
@@ -126,6 +134,11 @@ class AnalogTab(QWidget):
         panel = self.panels[idx]
         if panel is not None:
             panel.setVoltage(v)
+
+    def setDisabled(self, idx, disabled):
+        panel = self.panels[idx]
+        if panel is not None:
+            panel.setDisabled(disabled)
 
     def apply_theme(self, name):
         for panel in self.panels:

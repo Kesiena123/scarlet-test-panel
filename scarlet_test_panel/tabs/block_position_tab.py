@@ -1,4 +1,4 @@
-"""Block Position Monitor operator page (promt1.txt).
+"""Block Position Monitor operator page.
 
 Mirrors the industrial 'Block Position Monitor' HMI:
 
@@ -7,16 +7,16 @@ Mirrors the industrial 'Block Position Monitor' HMI:
   │   [ RUN ]  [ CALIBRATE ]   │        31.58 ft                  │
   ├────────────────────────────┼───────────────┬──────────────────┤
   │ BLOCK POSITION   31.58 ft  │ ENCODER       │ VELOCITY         │
-  │ CURRENT LAYER    1         │ COUNTER       │ 0.00 ft/min      │
+  │ CURRENT WRAP     1         │ COUNTER       │ 0.00 ft/min      │
   │ DIRECTION    ▼ ON BOTTOM   │ 4437          │                  │
   ├────────────────────────────┴───────────────┴──────────────────┤
-  │ CALIBRATION TABLE   (Layer | Initial Tape Reading | Counter | │
+  │ CALIBRATION TABLE   (Wrap | Initial Tape Reading | Counter | │
   │   Counts/ft)  4 operator rows, selectable                     │
   ├───────────────────────────────────────────────────────────────┤
   │  TREND  (BLOCK POSITION vs TIME)    [ 1 Minute ] [ 1 Hour ]    │
   ├───────────────────────────────────────────────────────────────┤
   │ RESET COUNTER │ LOAD SAVED CALIBRATION │ SAVE CALIBRATION │   │
-  │ SET LAYER │ SET BLOCK HEIGHT │ SET WITS CORRECTION │           │
+  │ SET WRAP │ SET BLOCK HEIGHT │ SET WITS CORRECTION │           │
   └───────────────────────────────────────────────────────────────┘
 
 Every telemetry value shown here is what the firmware REPORTED (the firmware
@@ -43,16 +43,21 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QGroupBox,
     QPushButton, QDoubleSpinBox, QSpinBox, QRadioButton, QComboBox, QLineEdit,
     QFrame, QScrollArea, QMessageBox, QDialog, QFormLayout, QDialogButtonBox,
+    QSizePolicy,
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QEvent
 from PyQt5.QtGui import QColor, QPainter, QPen, QBrush, QFont, QFontMetrics
 
 from ..config import (
     ACCENT, BG_CARD, BG_INNER, BORDER, TEXT_DARK, TEXT_MID, TEXT_LITE,
+    TEXT_ON_DARK,
     FW_MAX_CAL_POINTS,
+    FT_TO_M,
+    SENSOR_CONFIG,
 )
 from ..widgets.graph_plot import _IndustrialTrendGraph
-from ..services.security import ROLE_SUPERVISOR
+from ..widgets.flow_layout import FlowLayout
+from ..services.security import ROLE_SUPERVISOR, ROLE_OPERATOR
 from ..services import layers as layers_service
 
 # ── Industrial status colours (always paired with text, never color-only) ─
@@ -70,6 +75,47 @@ SECTION_TITLE = "#4C6B8A"
 MIN_REF = -100000.0
 MAX_REF = 1000000.0
 
+# Serial link to the Arduino intermittently drops / corrupts command frames
+# (measured ~50% loss on the CH340 link). The calibration pipeline retries each
+# command a couple of times before declaring failure so a single lost ack does
+# not surface as "CALIBRATION NOT SAVED". Values are send-attempt counts and a
+# pacing delay so retried commands do not collide with the device's report
+# stream.
+CAL_SEND_ATTEMPTS = 5
+CAL_RETRY_DELAY_MS = 300
+
+# Responsive value table, matching the Dashboard drilling monitor: the cells
+# are laid out in as many equal columns as the visible width allows and each
+# cell stretches to fill its column, so there is never a horizontal scrollbar
+# and the last row always fills the full width.
+READOUT_GAP = 6
+READOUT_MIN_CELL_W = 165
+READOUT_MAX_COLUMNS = 5
+# Chrome around the value table: the page margins plus the section frame, so
+# the computed cell width never overflows the visible viewport.
+READOUT_PAGE_MARGIN = 32
+
+
+class _SectionCells:
+    """Collects the value cells of one readout section in build order.
+
+    The builders add the cells exactly as before (``addWidget``) and the call
+    is forwarded to the section's FlowLayout, so Qt owns every widget from the
+    start. The order is remembered so ``_relayout_readout`` can give each cell
+    the width of one responsive column.
+    """
+
+    def __init__(self, flow, cells):
+        self._flow = flow
+        self.cells = cells
+
+    def addWidget(self, widget):
+        self._flow.addWidget(widget)
+        self.cells.append(widget)
+
+    def __getattr__(self, name):
+        return getattr(self._flow, name)
+
 
 class BlockPositionTab(QWidget):
     def __init__(self, main_window, roles, audit, parent=None):
@@ -84,6 +130,11 @@ class BlockPositionTab(QWidget):
         self.op_mode = str(self.mw._settings.get("op_mode", "RUN"))
         if self.op_mode not in ("RUN", "CALIBRATE"):
             self.op_mode = "RUN"
+
+        # Display-only unit for the BLOCK POSITION readout. The internal
+        # position is ALWAYS feet (block_position_ft); METERS is only a display
+        # conversion (meters = feet x 0.3048). promt1.txt.
+        self._position_unit = "FT"
 
         # Selected calibration row (1-based layer) for the table editing.
         self._selected_row = 1
@@ -113,6 +164,24 @@ class BlockPositionTab(QWidget):
         # calibration is explicitly saved / loaded / reset (or matches device).
         self._cal_editing = False
 
+        # promt2: per-layer CAPTURE + main CALIBRATE / SAVE ALL LAYERS flow.
+        # _capture_btns[i] is the CAPTURE button for table row i (parallel to
+        # _cal_rows); _capturing[i] guards re-entrancy while a tick request is
+        # in flight. _save_all_active guards the all-layers save pipeline,
+        # _cal_saved_all holds the multi-line "✓ CALIBRATION SAVED — ALL
+        # LAYERS" confirmation, and _last_cal_saved_at is the persisted
+        # timestamp shown in that confirmation.
+        self._capture_btns = []
+        self._capturing = []
+        self._save_all_active = False
+        self._cal_saved_all = None
+        self._last_cal_saved_at = str(
+            self.mw._settings.get("cal_last_saved", "") or "")
+        # Until this monotonic deadline, a fresh "\u2713 TICK CAPTURED"
+        # confirmation stays visible even though the captured tick makes the
+        # table calibrate-dirty (the MODIFIED notice follows after).
+        self._capture_msg_until = 0.0
+
         # Per-operation command bookkeeping (PENDING / SAVED / FAILED).
         #  op kind -> { "reqs": set[int], "ok": None|bool, "detail": str }
         self._ops = {}
@@ -131,6 +200,11 @@ class BlockPositionTab(QWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        # Responsive: never scroll horizontally — the value tables re-flow into
+        # fewer equal columns on the visible width and the calibration table and
+        # heading wrap, so narrow screens never get a sideways scrollbar.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; } "
@@ -142,18 +216,31 @@ class BlockPositionTab(QWidget):
             "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }")
         scroll.setWidget(container)
         page_layout.addWidget(scroll)
+        # The readout table is placed from the *visible* width of this viewport
+        # (the same approach as the Dashboard drilling monitor) so the column
+        # count is correct even when the window is resized while another tab
+        # is on screen.
+        self._readout_scroll = scroll
+        self._readout_viewport = scroll.viewport()
+        self._readout_viewport.installEventFilter(self)
 
-        # ── Heading ------------------------------------------------------
+        # ── Heading (responsive: title + subtitle stack and wrap) ----------
         head = QHBoxLayout()
+        head.setSpacing(8)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(1)
         title = QLabel("BLOCK POSITION MONITOR")
         title.setStyleSheet(
             f"color:{TEXT_DARK.name()}; font-family:'Segoe UI'; font-size:20px; "
             "font-weight:bold; letter-spacing:2px; background:transparent;")
         subtitle = QLabel("live device-reported measurement  •  multi-point calibration")
+        subtitle.setWordWrap(True)
         subtitle.setStyleSheet(
             f"color:{TEXT_MID.name()}; font-family:'Segoe UI'; font-size:10px; "
             "background:transparent;")
-        head.addWidget(title)
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        head.addLayout(title_col)
         right_col = QVBoxLayout()
         right_col.setSpacing(0)
         head.addLayout(right_col)
@@ -175,89 +262,388 @@ class BlockPositionTab(QWidget):
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(handler)
             mv.addWidget(btn, 1)
-        mv.addWidget(QLabel("(operation mode is dashboard state, not a firmware mode)"))
-        root.addWidget(mode_group)
+        _mode_hint = QLabel("(operation mode is dashboard state, not a firmware mode)")
+        _mode_hint.setWordWrap(True)
+        mv.addWidget(_mode_hint, 1)
+        # CURRENT MODE OF OPERATION box removed from the dashboard. Keep the
+        # widgets alive (hidden, out of layout) so the RUN/CALIBRATE mode logic
+        # and role handling keep working; only the visible box is gone.
+        mode_group.setParent(container)
+        mode_group.hide()
         self._apply_mode_buttons()
 
-        # ── Primary readout grid -----------------------------------------
-        grid = QGridLayout()
-        grid.setSpacing(12)
+        # ── Responsive value table (table_value.txt) ---------------------
+        # All value boxes are organised into three labelled sections —
+        # POSITION / HOOKLOAD / SLIP WINDOW INFORMATION. Each section holds a
+        # responsive table of equal-sized cells (Label -> large value -> unit)
+        # that reflows into fewer columns on narrow screens instead of
+        # squeezing or scrolling, exactly like the Dashboard drilling monitor.
+        # The app remains the single source of every value; this is purely a
+        # presentation re-layout.
+        readout_col = QVBoxLayout()
+        readout_col.setSpacing(6)
+        self._readout_flow = readout_col
+        self._readout_cards = []
+        self._readout_rows = []
+        self._readout_columns = 0
 
-        # BLOCK POSITION card
-        pos_card = QGroupBox("BLOCK POSITION")
-        pos_card.setStyleSheet(self._group_box_style())
-        pv = QVBoxLayout(pos_card)
-        pv.setContentsMargins(14, 16, 14, 12)
-        pv.setSpacing(6)
-        self.pos_value_lbl = QLabel("--")
-        self.pos_value_lbl.setAlignment(Qt.AlignCenter)
-        self.pos_value_lbl.setMinimumHeight(96)
-        self.pos_value_lbl.setStyleSheet(self._figure_style())
-        pv.addWidget(self.pos_value_lbl)
+        # Cell height only: the width follows the responsive column count so
+        # the readout numbers, the unit/toggle line and the state captions all
+        # have room. Long captions wrap instead of clipping.
+        cell_h = 116
+
+        def _section(title):
+            sec = QGroupBox(title)
+            sec.setStyleSheet(self._group_box_style(SECTION_TITLE))
+            # The section keeps its FlowLayout: a plain QLayout holding these
+            # cells inside the QGroupBox aborts Qt when the tab is first
+            # shown. The responsive equal columns come from
+            # _relayout_readout, which resizes the cells to the column width
+            # the visible width allows and lets the flow wrap them.
+            flow = FlowLayout(sec, 0, 6, sec)
+            flow.setContentsMargins(8, 4, 8, 6)
+            cells = []
+            self._readout_rows.append([sec, flow, cells])
+            return sec, _SectionCells(flow, cells)
+
+        def _value_cell(title):
+            cell = QGroupBox(title)
+            cell.setStyleSheet(self._cell_box_style())
+            cell.setFixedHeight(cell_h)
+            cv = QVBoxLayout(cell)
+            cv.setContentsMargins(10, 6, 10, 6)
+            cv.setSpacing(3)
+            return cell, cv
+
+        def _unit_lbl(text):
+            u = QLabel(text)
+            u.setAlignment(Qt.AlignCenter)
+            # Wrap long captions ("SEC - LIVE COUNTUP / TIME") onto a second
+            # line instead of clipping them inside the box.
+            u.setWordWrap(True)
+            # Captions keep only the height they need; the white readout
+            # screen below/above absorbs the rest of the box height.
+            u.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+            u.setStyleSheet(
+                f"color:{TEXT_MID.name()}; background:transparent; "
+                "font-family:'Segoe UI'; font-size:10px; font-weight:600;")
+            return u
+
+        def _digits_lbl(min_h):
+            lbl = QLabel("--")
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setMinimumHeight(min_h)
+            # The readout is the screen box: it takes the spare height of the
+            # cell so a taller CELL_H visibly grows the white display.
+            lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+            return lbl
+
+        # ── POSITION INFORMATION ---------------------------------------
+        sec, flow = _section("POSITION INFORMATION")
+        self._readout_cards.append(sec)
+
+        cell, cv = _value_cell("BLOCK POSITION")
+        self.unit_toggle_btn = QPushButton("M")
+        self.unit_toggle_btn.setFixedSize(40, 18)
+        self.unit_toggle_btn.setStyleSheet(self._unit_toggle_style(active=False))
+        self.unit_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.unit_toggle_btn.setToolTip("Switch the Block Position display between FT and M")
+        self.unit_toggle_btn.clicked.connect(self._on_unit_toggle)
+        posrow = QHBoxLayout()
+        posrow.setSpacing(8)
+        self.pos_value_lbl = _digits_lbl(30)
+        self.pos_value_lbl.setStyleSheet(self._block_figure_style())
+        posrow.addWidget(self.pos_value_lbl, 1)
+        posrow.addWidget(self.unit_toggle_btn, 0, Qt.AlignTop)
+        cv.addLayout(posrow)
         self.cal_status_lbl = QLabel("● NO CALIBRATION")
         self.cal_status_lbl.setAlignment(Qt.AlignCenter)
+        self.cal_status_lbl.setWordWrap(True)
         self.cal_status_lbl.setStyleSheet(self._cal_status_style("no_calibration"))
-        pv.addWidget(self.cal_status_lbl)
-        grid.addWidget(pos_card, 0, 0)
+        cv.addWidget(self.cal_status_lbl)
+        flow.addWidget(cell)
 
-        # ENCODER COUNTER card
-        enc_card = QGroupBox("ENCODER COUNTER")
-        enc_card.setStyleSheet(self._group_box_style())
-        ev = QVBoxLayout(enc_card)
-        ev.setContentsMargins(14, 16, 14, 12)
-        ev.setSpacing(6)
-        self.counter_lbl = QLabel("--")
-        self.counter_lbl.setAlignment(Qt.AlignCenter)
-        self.counter_lbl.setMinimumHeight(72)
-        self.counter_lbl.setStyleSheet(self._white_figure_style())
-        ev.addWidget(self.counter_lbl)
-        grid.addWidget(enc_card, 0, 1)
+        cell, cv = _value_cell("ENCODER COUNTER")
+        self.counter_lbl = _digits_lbl(32)
+        self.counter_lbl.setStyleSheet(self._cell_figure_style())
+        cv.addWidget(self.counter_lbl)
+        cv.addWidget(_unit_lbl("TICKS"))
+        flow.addWidget(cell)
 
-        # VELOCITY card
-        vel_card = QGroupBox("VELOCITY")
-        vel_card.setStyleSheet(self._group_box_style())
-        vv = QVBoxLayout(vel_card)
-        vv.setContentsMargins(14, 16, 14, 12)
-        vv.setSpacing(6)
-        self.velocity_lbl = QLabel("--")
-        self.velocity_lbl.setAlignment(Qt.AlignCenter)
-        self.velocity_lbl.setMinimumHeight(72)
-        self.velocity_lbl.setStyleSheet(self._white_figure_style())
-        vv.addWidget(self.velocity_lbl)
-        grid.addWidget(vel_card, 0, 2)
+        cell, cv = _value_cell("VELOCITY")
+        self.velocity_lbl = _digits_lbl(32)
+        self.velocity_lbl.setStyleSheet(self._cell_figure_style())
+        cv.addWidget(self.velocity_lbl)
+        cv.addWidget(_unit_lbl("FT/MIN"))
+        flow.addWidget(cell)
 
-        # DIRECTION card (3-state lamp: DOWN / ON BOTTOM / UP)
-        dir_card = QGroupBox("DIRECTION")
-        dir_card.setStyleSheet(self._group_box_style())
-        dv = QVBoxLayout(dir_card)
-        dv.setContentsMargins(14, 16, 14, 12)
-        dv.setSpacing(6)
-        self.dir_lbl = QLabel("● STOPPED")
+        cell, cv = _value_cell("DIRECTION")
+        self.dir_lbl = QLabel("▼ DOWN")
         self.dir_lbl.setAlignment(Qt.AlignCenter)
-        self.dir_lbl.setMinimumHeight(54)
+        self.dir_lbl.setMinimumHeight(34)
         self.dir_lbl.setStyleSheet(self._dir_style("stopped"))
-        dv.addWidget(self.dir_lbl)
-        grid.addWidget(dir_card, 0, 3)
+        cv.addWidget(self.dir_lbl)
+        flow.addWidget(cell)
 
-        # CURRENT LAYER card
-        layer_card = QGroupBox("CURRENT LAYER")
-        layer_card.setStyleSheet(self._group_box_style())
-        lcv = QVBoxLayout(layer_card)
-        lcv.setContentsMargins(14, 16, 14, 12)
-        lcv.setSpacing(6)
-        self.layer_lbl = QLabel("1")
-        self.layer_lbl.setAlignment(Qt.AlignCenter)
-        self.layer_lbl.setMinimumHeight(72)
-        self.layer_lbl.setStyleSheet(self._white_figure_style())
-        lcv.addWidget(self.layer_lbl)
-        grid.addWidget(layer_card, 0, 4)
+        # BIT / HOLE DEPTH / BOTTOM STATE keep their dark LCD screens; the
+        # builders install the layout and captions exactly as before.
+        cell = QGroupBox("BIT POSITION")
+        cell.setStyleSheet(self._cell_box_style())
+        cell.setFixedHeight(cell_h)
+        self._build_bit_screen(cell)
+        flow.addWidget(cell)
 
-        grid.setColumnStretch(0, 3)
-        grid.setColumnStretch(1, 2)
-        grid.setColumnStretch(2, 2)
-        grid.setColumnStretch(3, 2)
-        grid.setColumnStretch(4, 2)
-        root.addLayout(grid)
+        cell = QGroupBox("HOLE DEPTH")
+        cell.setStyleSheet(self._cell_box_style())
+        cell.setFixedHeight(cell_h)
+        self._build_hole_depth_screen(cell)
+        flow.addWidget(cell)
+
+        cell = QGroupBox("BOTTOM STATE")
+        cell.setStyleSheet(self._cell_box_style())
+        cell.setFixedHeight(cell_h)
+        self._build_bottom_screen(cell)
+        flow.addWidget(cell)
+
+        cell, cv = _value_cell("STRING LENGTH")
+        self.string_length_lbl = _digits_lbl(30)
+        self.string_length_lbl.setStyleSheet(self._string_figure_style())
+        cv.addWidget(self.string_length_lbl)
+        self.sl_status_lbl = QLabel("● PIPE IN HOLE NOT SET")
+        self.sl_status_lbl.setAlignment(Qt.AlignCenter)
+        self.sl_status_lbl.setWordWrap(True)
+        self.sl_status_lbl.setStyleSheet(self._cal_status_style("no_calibration"))
+        cv.addWidget(self.sl_status_lbl)
+        flow.addWidget(cell)
+
+        readout_col.addWidget(sec)
+
+        # ── HOOKLOAD INFORMATION ----------------------------------------
+        # Single source, four readouts: HOOKLOAD = the live channel-0 analog
+        # value (mw.hookload_klb); MINIMUM VALUE / HIGH POINT = the ENGINEERING
+        # VALUES of the Hookload two-point calibration (SENSOR_CONFIG[0]
+        # cal_val_lo / cal_val_hi); VOLTAGE = the live channel-0 input voltage
+        # (V). No separate hookload engine — and no Pipe Weight channel exists,
+        # so that spec cell is intentionally not fabricated.
+        sec, flow = _section("HOOKLOAD INFORMATION")
+        self._readout_cards.append(sec)
+
+        cell, cv = _value_cell("HOOKLOAD")
+        self.hook_current_lbl = _digits_lbl(32)
+        self.hook_current_lbl.setStyleSheet(self._hook_cell_style())
+        cv.addWidget(self.hook_current_lbl)
+        cv.addWidget(_unit_lbl("KLB · LIVE"))
+        flow.addWidget(cell)
+
+        cell, cv = _value_cell("MINIMUM VALUE")
+        self.hook_low_lbl = _digits_lbl(32)
+        self.hook_low_lbl.setStyleSheet(self._hook_cell_style())
+        cv.addWidget(self.hook_low_lbl)
+        cv.addWidget(_unit_lbl("KLB · CAL LOW POINT"))
+        flow.addWidget(cell)
+
+        cell, cv = _value_cell("HIGH POINT")
+        self.hook_high_lbl = _digits_lbl(32)
+        self.hook_high_lbl.setStyleSheet(self._hook_cell_style())
+        cv.addWidget(self.hook_high_lbl)
+        cv.addWidget(_unit_lbl("KLB · CAL HIGH POINT"))
+        flow.addWidget(cell)
+
+        cell, cv = _value_cell("VOLTAGE")
+        self.hook_voltage_lbl = _digits_lbl(32)
+        self.hook_voltage_lbl.setStyleSheet(self._hook_cell_style())
+        cv.addWidget(self.hook_voltage_lbl)
+        cv.addWidget(_unit_lbl("V · CHANNEL-0 INPUT"))
+        flow.addWidget(cell)
+
+        readout_col.addWidget(sec)
+
+        # ── SLIP WINDOW INFORMATION ------------------------------------
+        sec, flow = _section("SLIP WINDOW INFORMATION")
+        self._readout_cards.append(sec)
+
+        cell, cv = _value_cell("SLIP WINDOW LOAD")
+        self.slip_load_disp_lbl = _digits_lbl(32)
+        self.slip_load_disp_lbl.setStyleSheet(self._slip_cell_style())
+        cv.addWidget(self.slip_load_disp_lbl)
+        cv.addWidget(_unit_lbl("KLB · INPUT + MINIMUM"))
+        flow.addWidget(cell)
+
+        cell, cv = _value_cell("SLIP WINDOW TIME")
+        self.slip_time_disp_lbl = _digits_lbl(32)
+        self.slip_time_disp_lbl.setStyleSheet(self._slip_cell_style())
+        cv.addWidget(self.slip_time_disp_lbl)
+        cv.addWidget(_unit_lbl("SEC · CONFIGURED"))
+        flow.addWidget(cell)
+
+        cell, cv = _value_cell("SLIP WINDOW TIMER")
+        self.slip_timer_lbl = _digits_lbl(32)
+        self.slip_timer_lbl.setStyleSheet(self._slip_cell_style())
+        cv.addWidget(self.slip_timer_lbl)
+        cv.addWidget(_unit_lbl("SEC · LIVE COUNTUP / TIME"))
+        flow.addWidget(cell)
+
+        cell, cv = _value_cell("STATUS")
+        self.slip_status_lbl = QLabel("NOT ACTIVE")
+        self.slip_status_lbl.setAlignment(Qt.AlignCenter)
+        self.slip_status_lbl.setMinimumHeight(26)
+        self.slip_status_lbl.setStyleSheet(self._slip_status_style("NOT ACTIVE"))
+        cv.addWidget(self.slip_status_lbl)
+        cv.addWidget(_unit_lbl("CONFIRMING / CONFIRMED STATE"))
+        flow.addWidget(cell)
+
+        readout_col.addWidget(sec)
+
+        root.addLayout(readout_col)
+
+        # ── PIPE IN HOLE / SLIP WINDOW inputs (promt.txt) ──────────────────
+        pih_group = QGroupBox("PIPE IN HOLE  ·  SLIP WINDOW SETTINGS")
+        pih_group.setStyleSheet(self._group_box_style(SECTION_TITLE))
+        pih_lay = QVBoxLayout(pih_group)
+        pih_lay.setContentsMargins(10, 8, 10, 6)
+        pih_lay.setSpacing(8)
+
+        pih_inner = QWidget()
+        pih_inner.setStyleSheet(
+            "QWidget { background:#FFFFFF; border:1px solid #E4DCCE; "
+            "border-radius:10px; }")
+        pih_row = QHBoxLayout(pih_inner)
+        pih_row.setContentsMargins(14, 10, 14, 10)
+        pih_row.setSpacing(10)
+
+        pih_hint = QLabel("Enter the Pipe in Hole depth in FEET:")
+        pih_hint.setStyleSheet(
+            f"color:{TEXT_MID.name()}; background:transparent; "
+            "font-family:'Segoe UI'; font-size:12px;")
+        pih_row.addWidget(pih_hint)
+
+        self.pipe_in_hole_spin = QDoubleSpinBox()
+        self.pipe_in_hole_spin.setRange(0.0, 999999.0)
+        self.pipe_in_hole_spin.setDecimals(2)
+        self.pipe_in_hole_spin.setSingleStep(10.0)
+        self.pipe_in_hole_spin.setValue(0.0)
+        self.pipe_in_hole_spin.setMinimumWidth(160)
+        self.pipe_in_hole_spin.setAlignment(Qt.AlignCenter)
+        self.pipe_in_hole_spin.setStyleSheet(
+            f"QDoubleSpinBox {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()}; "
+            f"border:1px solid {BORDER.name()}; border-radius:5px; "
+            f"font-family:'Consolas'; font-size:15px; font-weight:600; padding:6px; }}")
+        pih_row.addWidget(self.pipe_in_hole_spin)
+
+        pih_unit = QLabel("FT")
+        pih_unit.setStyleSheet(
+            f"color:{TEXT_DARK.name()}; background:transparent; "
+            "font-family:'Segoe UI'; font-size:13px; font-weight:bold;")
+        pih_row.addWidget(pih_unit)
+
+        self.pih_save_btn = QPushButton("SAVE")
+        self.pih_save_btn.setCursor(Qt.PointingHandCursor)
+        self.pih_save_btn.setMinimumWidth(100)
+        self.pih_save_btn.setStyleSheet(self._btn_style())
+        self.pih_save_btn.setToolTip(
+            "Save the Pipe in Hole value. String Length will be calculated as "
+            "Pipe in Hole + Block Position. This value persists across sessions.")
+        self.pih_save_btn.clicked.connect(self._on_save_pipe_in_hole)
+        pih_row.addWidget(self.pih_save_btn)
+
+        self.pih_msg_lbl = QLabel("")
+        self.pih_msg_lbl.setStyleSheet(
+            f"color:{TEXT_MID.name()}; background:transparent; "
+            "font-family:'Segoe UI'; font-size:11px; font-weight:bold;")
+        pih_row.addWidget(self.pih_msg_lbl, 1)
+
+        pih_lay.addWidget(pih_inner, 1)
+
+        # ── SLIP WINDOW load/time confirmation (slip_window.txt) ──────
+        slip_inner = QWidget()
+        slip_inner.setStyleSheet(
+            "QWidget { background:#FFFFFF; border:1px solid #E4DCCE; "
+            "border-radius:10px; }")
+        slip_row = QHBoxLayout(slip_inner)
+        slip_row.setContentsMargins(14, 10, 14, 10)
+        slip_row.setSpacing(10)
+
+        slip_hint = QLabel("Slip Window — Hookload must stay at or above the "
+                           "Slip Window Load (input + Hookload MINIMUM VALUE) "
+                           "for the whole Slip Window Time before the Bit "
+                           "Position is allowed to move:")
+        slip_hint.setWordWrap(True)
+        slip_hint.setStyleSheet(
+            f"color:{TEXT_MID.name()}; background:transparent; "
+            "font-family:'Segoe UI'; font-size:12px;")
+        slip_row.addWidget(slip_hint, 1)
+
+        slip_unit = QLabel("k-lb")
+        slip_unit.setStyleSheet(
+            f"color:{TEXT_DARK.name()}; background:transparent; "
+            "font-family:'Segoe UI'; font-size:13px; font-weight:bold;")
+        slip_row.addWidget(slip_unit)
+
+        self.slip_window_load_spin = QDoubleSpinBox()
+        self.slip_window_load_spin.setRange(0.0, 2000.0)
+        self.slip_window_load_spin.setDecimals(2)
+        self.slip_window_load_spin.setSingleStep(1.0)
+        self.slip_window_load_spin.setValue(20.0)
+        self.slip_window_load_spin.setMinimumWidth(120)
+        self.slip_window_load_spin.setAlignment(Qt.AlignCenter)
+        self.slip_window_load_spin.setStyleSheet(
+            f"QDoubleSpinBox {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()}; "
+            f"border:1px solid {BORDER.name()}; border-radius:5px; "
+            f"font-family:'Consolas'; font-size:15px; font-weight:600; padding:6px; }}")
+        slip_row.addWidget(self.slip_window_load_spin)
+
+        slip_unit2 = QLabel("sec")
+        slip_unit2.setStyleSheet(
+            f"color:{TEXT_DARK.name()}; background:transparent; "
+            "font-family:'Segoe UI'; font-size:13px; font-weight:bold;")
+        slip_row.addWidget(slip_unit2)
+
+        self.slip_window_time_spin = QDoubleSpinBox()
+        self.slip_window_time_spin.setRange(0.1, 3600.0)
+        self.slip_window_time_spin.setDecimals(2)
+        self.slip_window_time_spin.setSingleStep(0.5)
+        self.slip_window_time_spin.setValue(5.0)
+        self.slip_window_time_spin.setMinimumWidth(120)
+        self.slip_window_time_spin.setAlignment(Qt.AlignCenter)
+        self.slip_window_time_spin.setStyleSheet(
+            f"QDoubleSpinBox {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()}; "
+            f"border:1px solid {BORDER.name()}; border-radius:5px; "
+            f"font-family:'Consolas'; font-size:15px; font-weight:600; padding:6px; }}")
+        slip_row.addWidget(self.slip_window_time_spin)
+
+        self.slip_save_btn = QPushButton("SAVE")
+        self.slip_save_btn.setCursor(Qt.PointingHandCursor)
+        self.slip_save_btn.setMinimumWidth(90)
+        self.slip_save_btn.setStyleSheet(self._btn_style())
+        self.slip_save_btn.setToolTip(
+            "Save the Slip Window Load (k-lb) and Time (seconds). The Bit "
+            "Position stays constant until Hookload holds at/above the load "
+            "INPUT + the Hookload MINIMUM VALUE for the full Time. Persists "
+            "across sessions.")
+        self.slip_save_btn.clicked.connect(self._on_save_slip_window)
+        slip_row.addWidget(self.slip_save_btn)
+
+        self.slip_msg_lbl = QLabel("")
+        self.slip_msg_lbl.setStyleSheet(
+            f"color:{TEXT_MID.name()}; background:transparent; "
+            "font-family:'Segoe UI'; font-size:11px; font-weight:bold;")
+        slip_row.addWidget(self.slip_msg_lbl, 1)
+
+        pih_lay.addWidget(slip_inner, 1)
+
+        # Load the saved Pipe in Hole value into the spin box on startup.
+        saved_pih = self.mw.pipe_in_hole_ft
+        if saved_pih is not None:
+            self.pipe_in_hole_spin.setValue(float(saved_pih))
+        # Load the saved Slip Window Load / Time into the spin boxes.
+        saved_slip_load = self.mw.slip_window_load_klb
+        if saved_slip_load is not None:
+            self.slip_window_load_spin.setValue(float(saved_slip_load))
+        saved_slip_time = self.mw.slip_window_time_sec
+        if saved_slip_time is not None:
+            self.slip_window_time_spin.setValue(float(saved_slip_time))
+
+        root.addWidget(pih_group)
 
         # ── RESULT / reset banner ----------------------------------------
         self.banner_lbl = QLabel("")
@@ -265,7 +651,7 @@ class BlockPositionTab(QWidget):
         root.addWidget(self.banner_lbl)
 
         # ── Calibration table ----------------------------------------------
-        cal_group = QGroupBox("CALIBRATION  (Level | Encoder Counts | Position (ft) | Counts/ft)")
+        cal_group = QGroupBox("CALIBRATION  (Wrap | Encoder Counts | Position (ft) | Counts/ft)")
         cal_group.setStyleSheet(self._group_box_style(SECTION_TITLE))
         cv = QVBoxLayout(cal_group)
         cv.setContentsMargins(12, 14, 12, 10)
@@ -284,12 +670,13 @@ class BlockPositionTab(QWidget):
         # Header row
         header = QHBoxLayout()
         header.setSpacing(6)
-        for col in ("", "LEVEL", "ENCODER COUNTS", "POSITION (FT)", "COUNTS/FT"):
+        for col in ("", "WRAP", "ENCODER COUNTS", "POSITION (FT)",
+                    "CAPTURE", "COUNTS/FT"):
             l = QLabel(col)
             l.setStyleSheet(
-                f"color:{TEXT_MID.name()}; background:{BG_INNER.name()}; "
-                "font-family:'Segoe UI'; font-size:10px; font-weight:bold; "
-                "padding:4px 8px; border-radius:4px;")
+                f"color:{TEXT_ON_DARK.name()}; background:{BG_INNER.name()}; "
+                "font-family:'Segoe UI'; font-size:9px; font-weight:bold; "
+                "padding:3px 4px; border-radius:4px;")
             header.addWidget(l, 1)
         table_lay.addLayout(header)
 
@@ -308,29 +695,47 @@ class BlockPositionTab(QWidget):
             select_btn.setCursor(Qt.PointingHandCursor)
             select_btn.setStyleSheet(self._row_select_style())
             select_btn.clicked.connect(lambda _c, idx=i: self._select_row(idx))
-            layer_lbl = QLabel(f"Level {i+1}")
+            layer_lbl = QLabel(f"Wrap {i+1}")
             layer_lbl.setAlignment(Qt.AlignLeft)
+            layer_lbl.setMinimumWidth(70)
             layer_lbl.setStyleSheet(f"background:transparent; color:{TEXT_DARK.name()}; "
                                     "font-family:'Segoe UI'; font-size:12px; font-weight:bold;")
             pulses_spin = QSpinBox()
             pulses_spin.setRange(-2000000, 2000000)
             pulses_spin.setValue(0)
+            pulses_spin.setMinimumWidth(120)
             pulses_spin.setStyleSheet(
-                f"QSpinBox {{ background:{BG_INNER.name()}; color:{TEXT_DARK.name()}; "
+                f"QSpinBox {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()}; "
                 f"border:1px solid {BORDER.name()}; border-radius:5px; "
-                "font-family:'Consolas'; font-size:13px; font-weight:600; padding:3px; }}")
+                f"font-family:'Consolas'; font-size:13px; font-weight:600; padding:3px; }}")
             feet_spin = QDoubleSpinBox()
             feet_spin.setRange(MIN_REF, MAX_REF)
             feet_spin.setDecimals(4)
             feet_spin.setValue(0.0)
+            feet_spin.setMinimumWidth(120)
             feet_spin.setStyleSheet(
-                f"QDoubleSpinBox {{ background:{BG_INNER.name()}; color:{TEXT_DARK.name()}; "
+                f"QDoubleSpinBox {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()}; "
                 f"border:1px solid {BORDER.name()}; border-radius:5px; "
-                "font-family:'Consolas'; font-size:13px; font-weight:600; padding:3px; }}")
+                f"font-family:'Consolas'; font-size:13px; font-weight:600; padding:3px; }}")
             cpf_lbl = QLabel("—")
             cpf_lbl.setAlignment(Qt.AlignRight)
+            cpf_lbl.setMinimumWidth(70)
             cpf_lbl.setStyleSheet(f"background:transparent; color:{TEXT_MID.name()}; "
                                   "font-family:'Consolas'; font-size:13px; font-weight:600;")
+            # promt2: per-layer CAPTURE CURRENT TICK — requests the Arduino's
+            # authoritative live tick and drops it into THIS row's ENCODER COUNTS
+            # field only. Never saves calibration; visually distinct from the
+            # main CALIBRATE/SAVE-ALL button.
+            capture_btn = QPushButton("CAPTURE")
+            capture_btn.setCursor(Qt.PointingHandCursor)
+            capture_btn.setMinimumWidth(88)
+            capture_btn.setStyleSheet(self._capture_btn_style())
+            capture_btn.setToolTip(
+                "Request the CURRENT encoder tick count from the Arduino and "
+                "place it into this wrap's ENCODER COUNTS field. The value "
+                "stays editable so you can fine-tune it. Does NOT save "
+                "calibration.")
+            capture_btn.clicked.connect(lambda _c, idx=i: self._on_capture_tick(idx))
             # promt3: editing a cell marks the calibration as MODIFIED / UNSAVED.
             pulses_spin.valueChanged.connect(lambda _v, idx=i: self._mark_modified(idx))
             feet_spin.valueChanged.connect(lambda _v, idx=i: self._mark_modified(idx))
@@ -338,24 +743,35 @@ class BlockPositionTab(QWidget):
             row.addWidget(layer_lbl, 1)
             row.addWidget(pulses_spin, 1)
             row.addWidget(feet_spin, 1)
+            row.addWidget(capture_btn, 0)
             row.addWidget(cpf_lbl, 1)
             table_lay.addLayout(row)
             self._cal_rows.append((select_btn, layer_lbl, pulses_spin, feet_spin, cpf_lbl, i))
-        table_lay.addWidget(QLabel(
+            self._capture_btns.append(capture_btn)
+            self._capturing.append(False)
+        _expl = QLabel(
             "Enter the ENCODER COUNTS (encoder counter anchor) and POSITION (FT) "
-            "(position anchor) directly into a level row, then press CALIBRATE / "
-            "SET LAYER / SAVE CALIBRATION to push them to the device. "
-            "COUNTS/FT is computed."))
+            "(position anchor) directly into a wrap row, or press that row's "
+            "CAPTURE to read the CURRENT live tick from the Arduino into "
+            "ENCODER COUNTS (editable). Then press CALIBRATE / SAVE ALL WRAPS "
+            "to push the complete configuration to the device. "
+            "COUNTS/FT is computed.")
+        _expl.setWordWrap(True)
+        _expl.setStyleSheet("color:" + TEXT_MID.name() + "; background:transparent;")
+        table_lay.addWidget(_expl)
         cv.addWidget(table_card)
         root.addWidget(cal_group)
+        # Kept so the Digital Sensor tab can scroll this existing calibration
+        # section into view instead of opening a second calibration editor.
+        self._cal_group = cal_group
 
-        # ── TREND (1 Minute / 1 Hour) --------------------------------------
-        graph_group = QGroupBox("TREND  —  block position vs time")
+        # ── BLOCK POSITION vs TIME TREND (promt1.txt) --------------------
+        graph_group = QGroupBox("BLOCK POSITION TREND  —  block position vs time")
         graph_group.setStyleSheet(self._group_box_style(SECTION_TITLE))
         gl = QVBoxLayout(graph_group)
         gl.setContentsMargins(8, 14, 8, 8)
         self.graph = _IndustrialTrendGraph(self._trend_samples, QColor(0x00, 0x00, 0x00),
-                                           default_range_s=60)
+                                           default_range_s=0)
         gl.addWidget(self.graph)
 
         range_row = QHBoxLayout()
@@ -376,12 +792,42 @@ class BlockPositionTab(QWidget):
         suffix = QLabel("current: ")
         suffix.setStyleSheet(f"background:transparent; color:{TEXT_MID.name()}; "
                              "font-family:'Segoe UI'; font-size:11px;")
-        self.graph_cur_lbl = QLabel("-- ft")
+        self.graph_cur_lbl = QLabel("-- FT")
         self.graph_cur_lbl.setStyleSheet(f"background:transparent; color:{TEXT_DARK.name()}; "
                                          "font-family:'Consolas'; font-size:12px; font-weight:bold;")
         range_row.addWidget(suffix)
         range_row.addWidget(self.graph_cur_lbl)
         gl.addLayout(range_row)
+
+        # Trend status indicator + PAUSE / RESUME + CLEAR TREND (promt1.txt).
+        # Pausing freezes ONLY the chart view; the sampler keeps recording.
+        # CLEAR TREND drops only the chart history.
+        self._trend_paused = False
+        self.trend_status_lbl = QLabel("AWAITING DATA")
+        self.trend_status_lbl.setStyleSheet(self._trend_status_style("standby"))
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
+        ctrl_row.addWidget(self.trend_status_lbl)
+        ctrl_row.addStretch(1)
+        self._pause_btn = QPushButton("PAUSE VIEW")
+        self._pause_btn.setCheckable(True)
+        self._pause_btn.setCursor(Qt.PointingHandCursor)
+        self._pause_btn.setStyleSheet(self._btn_style())
+        self._pause_btn.setToolTip(
+            "PAUSE VIEW freezes only the chart display. The encoder, Arduino "
+            "link and trend recording continue running in the background.")
+        self._pause_btn.toggled.connect(self._on_trend_pause)
+        ctrl_row.addWidget(self._pause_btn)
+        self._clear_trend_btn = QPushButton("CLEAR TREND")
+        self._clear_trend_btn.setCursor(Qt.PointingHandCursor)
+        self._clear_trend_btn.setStyleSheet(self._btn_style())
+        self._clear_trend_btn.setToolTip(
+            "CLEAR TREND removes only the chart history. Encoder tick, block "
+            "position, calibration and wraps keep working; the chart resumes "
+            "recording new live data immediately.")
+        self._clear_trend_btn.clicked.connect(self._on_clear_trend)
+        ctrl_row.addWidget(self._clear_trend_btn)
+        gl.addLayout(ctrl_row)
 
         # ── System / device-confirmed information --------------------------
         self._gb_sys = QGroupBox("SYSTEM  (device-confirmed)")
@@ -396,7 +842,7 @@ class BlockPositionTab(QWidget):
         formula_lbl = QLabel(
             "measuring model: position = P1 + (count − C1)/(C2 − C1) × (P2 − P1)  "
             "over the calibration anchors.\n"
-            "count, velocity, direction, calStatus and current layer are computed by the firmware.")
+            "count, velocity, direction, calStatus and current wraps are computed by the firmware.")
         formula_lbl.setWordWrap(True)
         formula_lbl.setStyleSheet(
             f"color:{TEXT_LITE.name()}; font-family:'Segoe UI'; font-size:10px;")
@@ -406,29 +852,37 @@ class BlockPositionTab(QWidget):
         self.status_lbl = QLabel("")
         self.status_lbl.setWordWrap(True)
         self.status_lbl.setStyleSheet(
-            f"color:{TEXT_DARK.name()}; background:{BG_INNER.name()}; "
+            f"color:{TEXT_ON_DARK.name()}; background:{BG_INNER.name()}; "
             f"border:1px solid {BORDER.name()}; border-radius:6px; "
             "font-family:'Segoe UI'; font-size:11px; font-weight:bold; padding:8px;")
         self.status_lbl.setMinimumHeight(34)
         root.addWidget(self.status_lbl)
 
-        # ── Primary action bar --------------------------------------------
-        actions = QHBoxLayout()
+        # ── Primary action bar (responsive: wraps to multiple rows) -------
+        # promt.txt: buttons must remain visible, sized consistently and never
+        # pushed off-screen on smaller laptops. A FlowLayout lets the full action
+        # bar wrap to additional rows when the row no longer fits, so it never
+        # forces horizontal overflow.
+        actions = FlowLayout(owner=container)
         actions.setSpacing(10)
-        # promt3: ONE dedicated CALIBRATE button — saves the currently selected
-        # layer's ENCODER COUNTS + POSITION (FT) to THAT layer only and persists it.
-        self.calibrate_btn = QPushButton("CALIBRATE")
+        self._action_flow = actions
+        # promt2: ONE primary CALIBRATE / SAVE ALL LAYERS button — reads EVERY
+        # layer input field, validates the complete set, and sends it all to the
+        # firmware as one configuration. Per-layer single writes remain on the
+        # SET LAYER button.
+        self.calibrate_btn = QPushButton("CALIBRATE / SAVE ALL WRAPS")
         self.calibrate_btn.setStyleSheet(self._calibrate_btn_style())
         self.calibrate_btn.setToolTip(
-            "Save the selected layer's ENCODER COUNTS + POSITION (FT) to that layer "
-            "only, then persist the calibration.")
+            "Validate ALL wrap ENCODER COUNTS + POSITION (FT) rows together and "
+            "save the complete configuration to the firmware. Success is shown "
+            "only after the device confirms the saved values.")
         self.reset_btn = QPushButton("RESET COUNTER")
-        self.reset_feet_btn = QPushButton("RESET FEET")
+        self.reset_feet_btn = QPushButton("RESET POSITION")
         self.load_btn = QPushButton("LOAD SAVED CALIBRATION")
         self.save_btn = QPushButton("SAVE CALIBRATION")
-        self.set_layer_btn = QPushButton("SET LAYER")
+        self.set_layer_btn = QPushButton("SET WRAP")
         self.set_height_btn = QPushButton("SET BLOCK HEIGHT")
-        self.delete_level_btn = QPushButton("DELETE LEVEL")
+        self.delete_level_btn = QPushButton("DELETE WRAP")
         self.set_polarity_btn = QPushButton("SET POLARITY")
         self.set_wits_btn = QPushButton("SET WITS CORRECTION")
         for btn, handler in ((self.calibrate_btn, self._on_calibrate),
@@ -445,7 +899,8 @@ class BlockPositionTab(QWidget):
             if btn is not self.calibrate_btn:
                 btn.setStyleSheet(self._btn_style())
             btn.clicked.connect(handler)
-            actions.addWidget(btn, stretch=1)
+            btn.setMinimumWidth(150 if btn is self.calibrate_btn else 120)
+            actions.addWidget(btn)
         root.addLayout(actions)
 
         # ── promt3: calibration save-status feedback ---------------------
@@ -465,6 +920,8 @@ class BlockPositionTab(QWidget):
 
     # ------------------------------------------------------------------ mode
     def _set_mode(self, mode):
+        if not self.roles.at_least(ROLE_SUPERVISOR):
+            return
         if mode == self.op_mode:
             return
         self.op_mode = mode
@@ -492,24 +949,55 @@ class BlockPositionTab(QWidget):
 
     # ------------------------------------------------------------------ role
     def _apply_role(self, role):
-        # Calibration entry + save (pulse/feet inputs, CALIBRATE, SAVE, LOAD,
-        # SET LAYER, SET BLOCK HEIGHT) is available to EVERY role — it is the
-        # core operator calibration function (promt3: default input editable +
-        # saveable). Destructive/system actions (RESET, DELETE, SET POLARITY,
-        # SET WITS, operation-mode switch) stay gated to Supervisor+.
-        calibration_editable = True                     # all roles
-        supervisor = self.roles.at_least(ROLE_SUPERVISOR)
+        # promt.txt two-role RBAC: OPERATOR = view-only (monitoring data stays
+        # live, but EVERY configuration / calibration control is disabled);
+        # ENGINEER = full access (all calibration + system controls enabled).
+        engineer = self.roles.is_engineer()
         for btn in (self.calibrate_btn, self.load_btn, self.save_btn,
                     self.set_layer_btn, self.set_height_btn):
-            btn.setEnabled(calibration_editable)
+            btn.setEnabled(engineer)
+        for btn in self._capture_btns:
+            btn.setEnabled(engineer)
         for btn in (self.reset_btn, self.reset_feet_btn, self.delete_level_btn,
                     self.set_polarity_btn, self.set_wits_btn,
                     self.run_btn, self.cal_btn):
-            btn.setEnabled(supervisor)
-        # The calibration table's editable input cells are always editable.
+            btn.setEnabled(engineer)
+        # The calibration table's input cells are view-only for Operators.
         for _sbtn, _llbl, pulses_spin, feet_spin, _cpf, _i in self._cal_rows:
-            pulses_spin.setEnabled(calibration_editable)
-            feet_spin.setEnabled(calibration_editable)
+            pulses_spin.setEnabled(engineer)
+            feet_spin.setEnabled(engineer)
+        # Pipe in Hole (promt.txt): OPERATOR views the value; only ENGINEER
+        # may modify/save it.
+        if hasattr(self, "pipe_in_hole_spin"):
+            self.pipe_in_hole_spin.setEnabled(engineer)
+        if hasattr(self, "pih_save_btn"):
+            self.pih_save_btn.setEnabled(engineer)
+        # Slip Window (slip_window.txt): same view/engineer-only rule.
+        if hasattr(self, "slip_window_load_spin"):
+            self.slip_window_load_spin.setEnabled(engineer)
+        if hasattr(self, "slip_window_time_spin"):
+            self.slip_window_time_spin.setEnabled(engineer)
+        if hasattr(self, "slip_save_btn"):
+            self.slip_save_btn.setEnabled(engineer)
+
+    def _auto_return_to_operator(self):
+        """promt.txt: after any successful Engineer modification, immediately
+        return the role to OPERATOR (view-only). Only does something when an
+        ENGINEER session is active; the role change notifies all RoleManager
+        subscribers (status-bar indicator, this tab's _apply_role, header).
+        """
+        try:
+            if self.roles is not None and self.roles.is_engineer():
+                actor = self.roles.role()
+                self.roles.set_role(ROLE_OPERATOR)
+                try:
+                    self.audit.record(
+                        "ROLE_CHANGE", "Engineer auto-return to OPERATOR after modification",
+                        actor)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # ––––––––––––––––––––– styling helpers –––––––––––––––––────────────
     def _theme(self):
@@ -528,6 +1016,21 @@ class BlockPositionTab(QWidget):
                 f"QGroupBox::title {{ subcontrol-origin:margin; left:12px; top:0px; "
                 f"padding:2px 8px; color:{color}; background:{bg}; "
                 f"border-radius:5px; }}")
+
+    def _cell_box_style(self):
+        # Compact card chrome for individual value-table cells: slimmer
+        # title, minimal top margin and padding so the 96px-high cells keep
+        # room for the readout itself (table_value.txt).
+        t = self._theme()
+        bg = t.color_name("BG_CARD")
+        border = t.color_name("BORDER")
+        return (f"QGroupBox {{ color:{t.color_name('ACCENT')}; font-family:'Segoe UI'; "
+                f"font-size:10px; font-weight:bold; letter-spacing:0.5px; "
+                f"border:1px solid {border}; border-radius:8px; margin-top:2px; "
+                f"padding-top:2px; background:{bg}; }} "
+                f"QGroupBox::title {{ subcontrol-origin:margin; left:10px; top:0px; "
+                f"padding:1px 6px; color:{t.color_name('ACCENT')}; background:{bg}; "
+                f"border-radius:4px; }}")
 
     def _btn_style(self):
         base, hover, press = "#C0392B", "#A93026", "#8E241C"
@@ -589,7 +1092,7 @@ class BlockPositionTab(QWidget):
         have been verified (no immediate "saved" claim)."""
         if getattr(self, "calibrate_btn", None) is None:
             return
-        self.calibrate_btn.setText(f"SAVING\u2026 LAYER {int(layer_pk)}")
+        self.calibrate_btn.setText(f"SAVING\u2026 WRAP {int(layer_pk)}")
         self.calibrate_btn.setStyleSheet(self._calibrate_btn_saving_style())
         self._cal_save_phase = "saving"
         self._save_flash_timer.stop()
@@ -600,7 +1103,7 @@ class BlockPositionTab(QWidget):
         to CALIBRATE (the success indicator is never shown on failure)."""
         if getattr(self, "calibrate_btn", None) is None:
             return
-        self.calibrate_btn.setText(f"\u2715  NOT SAVED \u2014 LAYER {int(layer_pk)}")
+        self.calibrate_btn.setText(f"\u2715  NOT SAVED \u2014 WRAP {int(layer_pk)}")
         self.calibrate_btn.setStyleSheet(self._calibrate_btn_fail_style())
         self._cal_save_phase = "failed"
         self._save_flash_timer.stop()
@@ -612,7 +1115,7 @@ class BlockPositionTab(QWidget):
         layer is saved (verified), then reverts to CALIBRATE."""
         if getattr(self, "calibrate_btn", None) is None:
             return
-        self.calibrate_btn.setText(f"\u2713  SAVED \u2014 LAYER {int(layer_pk)}")
+        self.calibrate_btn.setText(f"\u2713  SAVED \u2014 WRAP {int(layer_pk)}")
         self.calibrate_btn.setStyleSheet(self._calibrate_btn_saved_style())
         self._cal_save_phase = "saved"
         self._save_flash_timer.stop()
@@ -621,7 +1124,7 @@ class BlockPositionTab(QWidget):
     def _restore_calibrate_btn(self):
         if getattr(self, "calibrate_btn", None) is None:
             return
-        self.calibrate_btn.setText("CALIBRATE")
+        self.calibrate_btn.setText("CALIBRATE / SAVE ALL WRAPS")
         self.calibrate_btn.setStyleSheet(self._calibrate_btn_style())
         self._cal_save_phase = "idle"
 
@@ -629,8 +1132,10 @@ class BlockPositionTab(QWidget):
         bg = {"saved": NORMAL_BG, "modified": WARN_BG,
               "saving": WARN_BG, "not_saved": FAULT_BG,
               "error": FAULT_BG, "idle": BG_INNER}.get(kind, BG_INNER)
+        if not isinstance(bg, str):
+            bg = bg.name()
         fc = "#FFFFFF" if kind in ("saved", "modified", "saving",
-                                   "not_saved", "error") else TEXT_DARK.name()
+                                   "not_saved", "error") else TEXT_ON_DARK.name()
         return (f"color:{fc}; background:{bg}; border-radius:7px; "
                 f"font-family:'Segoe UI'; font-size:12px; font-weight:bold; padding:8px;")
 
@@ -643,15 +1148,43 @@ class BlockPositionTab(QWidget):
                 "border-radius:6px; font-family:'Segoe UI'; font-size:13px; font-weight:bold; "
                 "padding:8px 14px; }")
 
+    def _unit_toggle_style(self, active):
+        # Compact FT/M display toggle consistent with the industrial theme:
+        # neutral when inactive, slate-blue when active (shows the CURRENT unit).
+        base, hover, press = "#4C6B8A", "#3F5C77", "#2F475E"
+        if active:
+            return (f"QPushButton {{ background:{base}; color:#FFFFFF; border:none; "
+                    f"border-radius:4px; font-family:'Segoe UI'; font-size:11px; "
+                    f"font-weight:bold; padding:2px 6px; }} "
+                    f"QPushButton:hover {{ background:{hover}; }} "
+                    f"QPushButton:pressed {{ background:{press}; }}")
+        return (f"QPushButton {{ background:#E8E2D6; color:#6B5E4E; border:none; "
+                f"border-radius:4px; font-family:'Segoe UI'; font-size:11px; "
+                f"font-weight:bold; padding:2px 6px; }} "
+                f"QPushButton:hover {{ background:#D8CFC0; }} "
+                f"QPushButton:pressed {{ background:#C8BDAD; }}")
+
     def _row_select_style(self, checked=False):
         if checked:
             return ("QPushButton { background:#4C6B8A; border-radius:4px; }")
         return ("QPushButton { background:#D8CFC0; border-radius:4px; }"
                 "QPushButton:hover { background:#B5A999; }")
 
-    def _figure_style(self):
+    def _capture_btn_style(self):
+        # promt2: CAPTURE CURRENT TICK — visually distinct from the green main
+        # CALIBRATE / SAVE ALL LAYERS button (slate blue secondary action).
+        base, hover, press = "#4C6B8A", "#3F5C77", "#2F475E"
+        return (f"QPushButton {{ background:{base}; color:#FFFFFF; border:none; "
+                f"border-radius:5px; font-family:'Segoe UI'; font-size:11px; font-weight:bold; "
+                f"padding:5px 10px; }} "
+                f"QPushButton:hover {{ background:{hover}; }} "
+                f"QPushButton:pressed {{ background:{press}; }} "
+                f"QPushButton:disabled {{ background:#A9A394; color:#F0EAE0; }}")
+
+    def _figure_style(self, tripping=False):
+        border = "4px solid #7A5C10" if tripping else "1px solid #E4DCCE"
         return ("color:#111111; background:#FFFFFF; font-family:'Consolas'; "
-                "font-size:56px; font-weight:bold; border:1px solid #E4DCCE; "
+                f"font-size:56px; font-weight:bold; border:{border}; "
                 "border-radius:12px; padding:12px;")
 
     def _big_value_style(self):
@@ -666,21 +1199,74 @@ class BlockPositionTab(QWidget):
                 "font-size:40px; font-weight:bold; border:1px solid #E4DCCE; "
                 "border-radius:12px; padding:8px;")
 
+    def _hook_figure_style(self):
+        # Smaller white screen used by the three HOOKLOAD readouts (Low Point /
+        # Current / High Point) so the card mirrors the Encoder Counter / Velocity
+        # box.
+        return ("color:#111111; background:#FFFFFF; font-family:'Consolas'; "
+                "font-size:30px; font-weight:bold; border:1px solid #E4DCCE; "
+                "border-radius:10px; padding:6px;")
+
+    def _block_figure_style(self):
+        # White screen used by the BLOCK POSITION cell (largest readout on the
+        # position table).
+        return ("color:#111111; background:#FFFFFF; font-family:'Consolas'; "
+                "font-size:26px; font-weight:bold; border:1px solid #E4DCCE; "
+                "border-radius:8px; padding:3px;")
+
+    def _string_figure_style(self, tripping=False):
+        border = "4px solid #7A5C10" if tripping else "1px solid #E4DCCE"
+        return ("color:#111111; background:#FFFFFF; font-family:'Consolas'; "
+                f"font-size:26px; font-weight:bold; border:{border}; "
+                "border-radius:8px; padding:3px;")
+
+    def _cell_figure_style(self):
+        # White screen used by the ENCODER COUNTER / VELOCITY cells.
+        return ("color:#111111; background:#FFFFFF; font-family:'Consolas'; "
+                "font-size:24px; font-weight:bold; border:1px solid #E4DCCE; "
+                "border-radius:8px; padding:3px;")
+
+    def _hook_cell_style(self):
+        # White screen used by the HOOKLOAD INFORMATION cells.
+        return ("color:#111111; background:#FFFFFF; font-family:'Consolas'; "
+                "font-size:26px; font-weight:bold; border:1px solid #E4DCCE; "
+                "border-radius:8px; padding:3px;")
+
+    def _slip_cell_style(self):
+        # White screen used by the SLIP WINDOW INFORMATION cells.
+        return ("color:#111111; background:#FFFFFF; font-family:'Consolas'; "
+                "font-size:24px; font-weight:bold; border:1px solid #E4DCCE; "
+                "border-radius:8px; padding:3px;")
+
+    def _slip_status_style(self, kind):
+        bg = {"CONFIRMED": NORMAL_BG, "CONFIRMING": WARN_BG}.get(kind, NEUTRAL_BG)
+        return (f"color:#FFFFFF; background:{bg}; font-family:'Segoe UI'; "
+                "font-size:12px; font-weight:bold; border-radius:6px; padding:4px;")
+
     def _dir_style(self, kind):
         bg = {"up": NORMAL_BG, "down": NEUTRAL_BG,
-              "on_bottom": WARN_BG, "stopped": NEUTRAL_BG}.get(kind, NEUTRAL_BG)
-        return f"color:#FFFFFF; background:{bg}; font-family:'Segoe UI'; font-size:15px; font-weight:bold; border-radius:8px; padding:8px;"
+              "on_bottom": WARN_BG, "stopped": NEUTRAL_BG, "none": NEUTRAL_BG}.get(kind, NEUTRAL_BG)
+        return f"color:#FFFFFF; background:{bg}; font-family:'Segoe UI'; font-size:13px; font-weight:bold; border-radius:6px; padding:5px;"
 
     def _cal_status_style(self, kind):
         bg = {"valid": NORMAL_BG, "out_of_range": FAULT_BG,
+              "tripping": WARN_BG,
               "no_calibration": NEUTRAL_BG}.get(kind, NEUTRAL_BG)
-        return f"color:#FFFFFF; background:{bg}; font-family:'Segoe UI'; font-size:12px; font-weight:bold; border-radius:7px; padding:6px;"
+        return f"color:#FFFFFF; background:{bg}; font-family:'Segoe UI'; font-size:10px; font-weight:bold; border-radius:6px; padding:3px;"
 
-    # ––––––––––––––––––––– sample source for the graph –––––––––––––─────
+    # ––––––––––––––––––– trend sample source (promt1.txt) –––––––─
+    # The chart draws from the controlled rolling sampler (mw.trend_data,
+    # one point per second via a QTimer), which records the EXACT live
+    # position the dashboard shows. The chart is READ-ONLY: it never
+    # computes, estimates or fabricates position values.
     def _trend_samples(self, seconds):
         try:
-            cutoff = datetime.datetime.now() - datetime.timedelta(seconds=seconds)
-            return [(ts, pos) for pos, ts in self.mw.position_history if ts >= cutoff]
+            data = self.mw.trend_data
+            if seconds and seconds > 0:
+                cutoff = datetime.datetime.now() - datetime.timedelta(
+                    seconds=float(seconds))
+                return [(ts, pos) for ts, pos in data if ts >= cutoff]
+            return list(data)
         except Exception:
             return []
 
@@ -688,6 +1274,44 @@ class BlockPositionTab(QWidget):
         for b, _s in self._range_buttons:
             b.setChecked(b is btn)
         self.graph.set_range_seconds(secs)
+
+    def _trend_status_style(self, kind):
+        bg = {"live": "#1E7A3E", "recording": "#D47B0F",
+              "standby": "#8C826F"}.get(kind, "#8C826F")
+        return (f"color:#FFFFFF; background:{bg}; border-radius:10px; padding:4px 10px; "
+                "font-family:'Segoe UI'; font-size:11px; font-weight:bold;")
+
+    def _refresh_trend_status(self):
+        """Trend status: ● LIVE when new data is arriving, TREND RECORDING
+        while the view is paused (sampling continues), otherwise STANDBY."""
+        if self._trend_paused:
+            self.trend_status_lbl.setText("TREND RECORDING")
+            self.trend_status_lbl.setStyleSheet(self._trend_status_style("recording"))
+            return
+        data = self.mw.trend_data
+        live = bool(data) and (datetime.datetime.now() - data[-1][0]).total_seconds() < 2.0
+        if live:
+            self.trend_status_lbl.setText("● LIVE")
+            self.trend_status_lbl.setStyleSheet(self._trend_status_style("live"))
+        else:
+            self.trend_status_lbl.setText("AWAITING DATA")
+            self.trend_status_lbl.setStyleSheet(self._trend_status_style("standby"))
+
+    def _on_trend_pause(self, checked):
+        """PAUSE VIEW / RESUME — freezes ONLY the chart display. The encoder,
+        Arduino link and background trend recording keep running (promt1.txt)."""
+        self._trend_paused = bool(checked)
+        self.graph.set_paused(self._trend_paused)
+        self._pause_btn.setText("RESUME" if self._trend_paused else "PAUSE VIEW")
+        self._refresh_trend_status()
+
+    def _on_clear_trend(self):
+        """CLEAR TREND — drops only the chart history. Encoder tick, block
+        position, calibration and wraps are untouched; the chart immediately
+        resumes collecting new live data."""
+        self.mw.clear_trend()
+        self.graph.update()
+        self._refresh_trend_status()
 
     # ––––––––––––––––––––– op bookkeeping –––––––––––––––––───────────────
     def _op_phase(self, kind):
@@ -708,12 +1332,13 @@ class BlockPositionTab(QWidget):
     def _refresh_status_line(self):
         lines = []
         for kind, label in (("reset", "Reset counter"),
-                            ("reset_feet", "Reset feet"),
+                            ("reset_feet", "Reset position"),
                             ("load_cal", "Load saved calibration"),
                             ("save_cal", "Save calibration"),
-                            ("set_layer", "Set layer"),
+                            ("save_all", "Calibrate all wraps"),
+                            ("set_layer", "Set wrap"),
                             ("set_height", "Set block height"),
-                            ("delete_level", "Delete level"),
+                            ("delete_level", "Delete wrap"),
                             ("set_polarity", "Set polarity"),
                             ("set_wits", "Set WITS correction"),
                             ("restore", "Restore defaults")):
@@ -736,7 +1361,7 @@ class BlockPositionTab(QWidget):
         s.setDecimals(decimals)
         s.setValue(value)
         s.setStyleSheet(
-            f"QDoubleSpinBox {{ background:{BG_INNER.name()}; color:{TEXT_DARK.name()}; "
+            f"QDoubleSpinBox {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()}; "
             f"border:1px solid {BORDER.name()}; border-radius:5px; "
             "font-family:'Segoe UI'; font-size:12px; padding:4px; }}")
         return s
@@ -758,7 +1383,7 @@ class BlockPositionTab(QWidget):
         spin.setValue(int(default))
         spin.setEnabled(False)
         spin.setStyleSheet(
-            f"QSpinBox {{ background:{BG_INNER.name()}; color:{TEXT_DARK.name()}; "
+            f"QSpinBox {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()}; "
             f"border:1px solid {BORDER.name()}; border-radius:5px; "
             "font-family:'Segoe UI'; font-size:12px; padding:4px; }}")
         manual_radio.toggled.connect(spin.setEnabled)
@@ -837,6 +1462,57 @@ class BlockPositionTab(QWidget):
         box.exec_()
         return box.clickedButton() is yes
 
+    def _prompt_starting_ft(self):
+        """Ask the operator for the NEW starting block position (FT).
+
+        A dark-themed numeric dialog with a decimal input box and
+        CONFIRM / CANCEL buttons. Only non-negative numeric feet
+        values are accepted (the travelling-block position model is positive);
+        CANCEL (or ESC) returns None and changes nothing.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("RESET STARTING POSITION")
+        dlg.setMinimumWidth(360)
+        dlg.setStyleSheet(
+            "QDialog { background:#20242C; }"
+            "QLabel { color:#FFFFFF; font-size:13px; }"
+            "QDoubleSpinBox { background:#181C24; color:#FFFFFF; border:1px solid #3A4050;"
+            " border-radius:5px; padding:6px; font-size:15px; font-weight:bold; }")
+
+        form = QFormLayout()
+        form.setContentsMargins(20, 20, 20, 14)
+        form.setSpacing(12)
+        form.addRow("Enter Starting Feet Position:", None)
+
+        spin = QDoubleSpinBox(dlg)
+        spin.setRange(0.0, 999999999.0)
+        spin.setDecimals(3)
+        spin.setSingleStep(0.5)
+        spin.setValue(max(0.0, self.mw.block_position_ft))
+        spin.setAlignment(Qt.AlignCenter)
+        form.addRow("Starting position", spin)
+        dlg.setLayout(form)
+
+        # Buttons: CONFIRM / CANCEL (dark theme, white text).
+        btns = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok, dlg)
+        btns.button(QDialogButtonBox.Ok).setText("CONFIRM")
+        btns.button(QDialogButtonBox.Cancel).setText("CANCEL")
+        for b in btns.buttons():
+            b.setStyleSheet(
+                "color:#FFFFFF; background:#2A2F3A; border:1px solid #3A4050;"
+                "padding:6px 16px; border-radius:5px; font-size:13px; font-weight:bold;")
+        btns.button(QDialogButtonBox.Ok).setStyleSheet(
+            "color:#FFFFFF; background:#1E7A3E; border:1px solid #2A9650;"
+            "padding:6px 16px; border-radius:5px; font-size:13px; font-weight:bold;")
+        form.addRow(btns)
+
+        accepted = btns.accepted.connect(dlg.accept)
+        _ = btns.rejected.connect(dlg.reject)
+        del accepted
+        if dlg.exec_() == QDialog.Accepted:
+            return spin.value()
+        return None
+
     # ––––––––––––––––––––– promt3: calibration save-status feedback –––––
     def _show_cal_msg(self, kind, text):
         self._cal_msg_kind = kind
@@ -849,8 +1525,8 @@ class BlockPositionTab(QWidget):
         """The prominent green SAVED banner showing the ACTUAL values that were
         just saved — the operator must see the new PULSES / FEET, not a generic
         'saved' note."""
-        return (f"\u2713 CALIBRATION SAVED \u2014 LAYER {int(layer_pk)}: "
-                f"{int(pulses):,} PULSES / {float(feet):,.3f} ft")
+        return (f"\u2713 CALIBRATION SAVED \u2014 WRAP {int(layer_pk)}: "
+                f"{int(pulses):} PULSES / {float(feet):.3f} ft")
 
     def _mark_modified(self, idx):
         # A user edit marks calibration as MODIFIED / UNSAVED until applied,
@@ -863,6 +1539,7 @@ class BlockPositionTab(QWidget):
             return
         self._cal_dirty = True
         self._cal_editing = True
+        self._cal_saved_all = None
         # Editing a row selects it: CALIBRATE / SET LAYER act on the row the
         # operator is typing in, not the previous selection (which could be a
         # different layer and silently save the wrong values).
@@ -870,8 +1547,8 @@ class BlockPositionTab(QWidget):
         if self._cal_msg_kind != "error":
             self._show_cal_msg(
                 "modified",
-                f"CALIBRATION MODIFIED — UNSAVED (Layer {idx + 1} edited). "
-                "Press CALIBRATE to save the selected layer.")
+                f"CALIBRATION MODIFIED — UNSAVED (Wrap {idx + 1} edited). "
+                "Press CALIBRATE / SAVE ALL WRAPS to save the complete set.")
 
     def _calibration_dirty(self):
         """True when any row's typed pulses/feet differ from the device-confirmed
@@ -885,43 +1562,44 @@ class BlockPositionTab(QWidget):
                 return True
         return False
 
+    def _saved_msg_text(self):
+        """Text of the green SAVED banner: all-layers confirmation if the last
+        confirmed save was the CALIBRATE / SAVE ALL flow, otherwise the
+        single-layer PULSES / FEET confirmation."""
+        if self._cal_saved_all:
+            return self._cal_saved_all
+        if self._last_saved is not None:
+            return self._save_confirmation(*self._last_saved)
+        return f"CALIBRATION SAVED — WRAP {self._selected_row}."
+
     def _sync_cal_msg(self):
         # Recompute the MODIFIED / SAVED indicator from live row values so the
         # message stays accurate after status refreshes / apply acks.
         if (self._cal_msg_kind in ("error", "saving", "not_saved")
-                or self._cal_saving_active):
+                or self._cal_saving_active or self._save_all_active):
             return  # keep the in-progress / explicit result visible
+        if (self._cal_msg_kind == "saved"
+                and _time.monotonic() < self._capture_msg_until):
+            return  # keep a fresh "✓ TICK CAPTURED" visible for its grace window
         if self._calibration_dirty():
             self._show_cal_msg(
                 "modified",
-                "CALIBRATION MODIFIED — UNSAVED. Press CALIBRATE to save the "
-                f"selected layer (Layer {self._selected_row}).")
+                "CALIBRATION MODIFIED — UNSAVED. Press CALIBRATE / SAVE ALL "
+                f"WRAPS (Wrap {self._selected_row} last edited).")
         elif self._cal_dirty:
             # A previous edit has now been applied to the device: report SAVED.
             self._cal_dirty = False
             self._cal_msg_kind = "saved"
-            if self._last_saved is not None:
-                self._show_cal_msg("saved",
-                                   self._save_confirmation(*self._last_saved))
-            else:
-                self._show_cal_msg(
-                    "saved",
-                    f"CALIBRATION SAVED — LAYER {self._selected_row}.")
+            self._show_cal_msg("saved", self._saved_msg_text())
         elif self._cal_msg_kind in ("saved", "modified"):
             # Values now agree with the device and no pending edit — keep the
             # "SAVED" confirmation (with the saved PULSES / FEET) visible.
             self._cal_msg_kind = "saved"
-            if self._last_saved is not None:
-                self._show_cal_msg("saved",
-                                   self._save_confirmation(*self._last_saved))
-            else:
-                self._show_cal_msg(
-                    "saved",
-                    f"CALIBRATION SAVED — LAYER {self._selected_row}.")
+            self._show_cal_msg("saved", self._saved_msg_text())
         # else: idle — leave whatever message (or none) as-is.
 
     # ––––––––––––––––––––– promt3: local calibration validation –––––––
-    def _validate_layer_input(self, layer_pk, pulses, feet):
+    def _validate_layer_input(self, layer_pk, pulses, feet, all_layers=None):
         """Validate one layer's ENCODER COUNTS / POSITION (FT) before saving (promt3 §8).
 
         Returns (ok:bool, error:str). Rejects invalid/empty/NaN/Inf inputs, and
@@ -932,23 +1610,30 @@ class BlockPositionTab(QWidget):
         position, no duplicate pulses, no duplicate positions, and counters and
         positions must sort in the same (monotonic) direction so the
         piecewise-linear interpolation is well defined and continuous.
+
+        ``all_layers`` is an optional dict ``{layer_pk: (pulses, feet)}``
+        providing the operator-entered values for ALL layers (read from the
+        spinbox widgets).  When given, pairwise consistency is checked against
+        the OTHER operator-entered rows rather than the (possibly stale) device-
+        confirmed values, so a complete CALIBRATE / SAVE ALL LAYERS pass can
+        validate the whole new table as one coherent set.
         """
         mw = self.mw
         try:
             pulses_int = int(float(pulses))
         except (TypeError, ValueError):
-            return False, f"Layer {layer_pk}: PULSES must be an integer."
+            return False, f"Wrap {layer_pk}: PULSES must be an integer."
         try:
             feet_f = float(feet)
         except (TypeError, ValueError):
-            return False, f"Layer {layer_pk}: FEET must be a number."
+            return False, f"Wrap {layer_pk}: FEET must be a number."
         pulses_f = float(pulses_int)
         if not (math.isfinite(pulses_f) and math.isfinite(feet_f)):
-            return False, f"Layer {layer_pk}: PULSES / FEET must be finite (no NaN/Inf)."
+            return False, f"Wrap {layer_pk}: PULSES / FEET must be finite (no NaN/Inf)."
         # A 0-ft position is "not configured" — the firmware rejects it as an
         # anchor (CAL_VAL_ZERO_POSITION) and treats (counter 0, 0 ft) as unused.
         if feet_f == 0.0:
-            return False, (f"Layer {layer_pk}: FEET cannot be 0.0 — a stored "
+            return False, (f"Wrap {layer_pk}: FEET cannot be 0.0 — a stored "
                            "anchor needs a non-zero physical position.")
         # Build the full snapshot with this layer's edit applied. Active rows are
         # those with non-zero position (the firmware's configured-mask semantics).
@@ -956,6 +1641,8 @@ class BlockPositionTab(QWidget):
         for i in range(1, FW_MAX_CAL_POINTS + 1):
             if i == layer_pk:
                 c, p = pulses_int, feet_f
+            elif all_layers and i in all_layers:
+                c, p = all_layers[i]
             else:
                 try:
                     c = int(mw.device.get(f"calCounter{i}", 0) or 0)
@@ -971,26 +1658,26 @@ class BlockPositionTab(QWidget):
             return True, ""
         for c, p, i in active:
             if not (math.isfinite(float(c)) and math.isfinite(float(p))):
-                return False, f"Layer {i}: non-finite value present — rejected."
+                return False, f"Wrap {i}: non-finite value present — rejected."
         # Pairwise duplicate + direction-consistency (firmware §promt2).
         for a_i in range(len(active)):
             ca, pa, ia = active[a_i]
             for b_i in range(a_i + 1, len(active)):
                 cb, pb, ib = active[b_i]
                 if ca == cb:
-                    return False, (f"Layer {ia} and Layer {ib}: duplicate "
+                    return False, (f"Wrap {ia} and Wrap {ib}: duplicate "
                                    f"PULSES {ca} — rejected.")
                 if abs(float(pa) - float(pb)) < 1e-6:
-                    return False, (f"Layer {ia} and Layer {ib}: duplicate "
+                    return False, (f"Wrap {ia} and Wrap {ib}: duplicate "
                                    f"FEET {float(pa):.3f} — rejected.")
                 cAbove = (ca > cb)
                 pAbove = (float(pa) > float(pb))
                 if cAbove != pAbove:
-                    return False, (f"Layer {ia} / Layer {ib}: encoder counter and "
+                    return False, (f"Wrap {ia} / Wrap {ib}: encoder counter and "
                                    "physical position disagree on direction — rejected.")
         # The edited layer must itself be a configured (active) row.
         if not any(i == layer_pk for _, _, i in active):
-            return False, f"Layer {layer_pk}: position is 0.0 (not configured) — rejected."
+            return False, f"Wrap {layer_pk}: position is 0.0 (not configured) — rejected."
         return True, ""
 
     # ––––––––––––––––––––– promt3: dedicated CALIBRATE button –––––––––
@@ -1014,7 +1701,7 @@ class BlockPositionTab(QWidget):
             # silent either (a repeated CALIBRATE must always show feedback).
             self._show_cal_msg(
                 "saving",
-                f"SAVING CALIBRATION \u2014 LAYER {layer_pk}: awaiting device "
+                f"SAVING CALIBRATION \u2014 WRAP {layer_pk}: awaiting device "
                 "confirmation for the current request\u2026")
             return
 
@@ -1028,8 +1715,8 @@ class BlockPositionTab(QWidget):
         # Stage 0 — show the transient in-progress state (NOT "saved").
         self._show_cal_msg(
             "saving",
-            f"SAVING CALIBRATION \u2014 LAYER {layer_pk}: {int(pulses):,} PULSES / "
-            f"{float(feet):,.3f} ft \u2026")
+            f"SAVING CALIBRATION \u2014 WRAP {layer_pk}: {int(pulses):} PULSES / "
+            f"{float(feet):.3f} ft \u2026")
         self._flash_saving(layer_pk)
         self._ops[op_kind] = {"reqs": set(), "ok": None, "detail": ""}
 
@@ -1046,20 +1733,23 @@ class BlockPositionTab(QWidget):
         def _finish_saved():
             self._cal_saving_active = False
             self._cal_dirty = False
+            # A single-layer save supersedes any previous "ALL LAYERS" banner.
+            self._cal_saved_all = None
             self._last_saved = (layer_pk, pulses, feet)
-            self._op_ok(op_kind, f"layer {layer_pk} calibration saved")
+            self._op_ok(op_kind, f"wrap {layer_pk} calibration saved")
             self._show_cal_msg("saved", self._save_confirmation(layer_pk, pulses, feet))
             self._flash_saved(layer_pk)
             _audit(True, "write+persist verified")
             self._refresh_status_line()
             self.refresh()
+            self._auto_return_to_operator()
 
         def _finish_failed(reason, revert=None):
             self._cal_saving_active = False
             self._op_fail(op_kind, reason)
             self._show_cal_msg(
                 "not_saved",
-                f"\u2715 CALIBRATION NOT SAVED \u2014 LAYER {layer_pk}: {reason}")
+                f"\u2715 CALIBRATION NOT SAVED \u2014 WRAP {layer_pk}: {reason}")
             self._flash_not_saved(layer_pk)
             if revert is not None:
                 # Return the active table to the previously confirmed value so
@@ -1116,86 +1806,520 @@ class BlockPositionTab(QWidget):
         def _persisted(req, data):
             # EEPROM write acked (ec==0). Now re-load from EEPROM and verify.
             self._ops.setdefault("load_cal", {"reqs": set(), "ok": None, "detail": ""})
-            rid = self.mw._cmd.load_calibration(on_done=_load_verify, on_fail=_load_fail)
-            if rid is not None:
-                self._ops["load_cal"]["reqs"].add(rid)
-            else:
-                _finish_failed("load-for-verify could not be sent (link down?)")
 
-        def _load_fail(req, reason):
-            _finish_failed(f"persistence verify failed: {reason}")
+            def _send_load(on_fail):
+                rid = self.mw._cmd.load_calibration(
+                    on_done=_load_verify, on_fail=on_fail)
+                if rid is not None:
+                    self._ops["load_cal"]["reqs"].add(rid)
+                return rid
+
+            self._retry_cmd(
+                _send_load,
+                lambda reason: _finish_failed(
+                    f"persistence re-load failed: {reason}"))
 
         def _stored(req, data):
             # Value WRITE confirmed & verified by CommandTracker echo. Persist.
             self._ops.setdefault("save_cal", {"reqs": set(), "ok": None, "detail": ""})
-            rid = self.mw._cmd.save_calibration(on_done=_persisted, on_fail=_persist_fail)
+
+            def _send_save(on_fail):
+                rid = self.mw._cmd.save_calibration(
+                    on_done=_persisted, on_fail=on_fail)
+                if rid is not None:
+                    self._ops["save_cal"]["reqs"].add(rid)
+                return rid
+
+            self._retry_cmd(
+                _send_save,
+                lambda reason: _finish_failed(f"EEPROM write failed: {reason}"))
+
+        def _send_point(on_fail):
+            rid = self.mw._cmd.set_calibration_point(
+                layer_pk, feet, counter=pulses, on_done=_stored,
+                on_fail=on_fail)
             if rid is not None:
-                self._ops["save_cal"]["reqs"].add(rid)
-            else:
-                _finish_failed("persist command could not be sent (link down?)")
+                self._ops[op_kind]["reqs"].add(rid)
+            return rid
 
-        def _persist_fail(req, reason):
-            _finish_failed(f"EEPROM write failed: {reason}")
+        self._retry_cmd(_send_point, lambda reason: _finish_failed(reason))
 
-        def _fail(req, reason):
-            _finish_failed(reason)
+    def _on_capture_tick(self, idx):
+        """promt2: CAPTURE CURRENT TICK for ONE layer row.
 
-        req_id = self.mw._cmd.set_calibration_point(
-            layer_pk, feet, counter=pulses, on_done=_stored, on_fail=_fail)
-        if req_id is None:
-            _finish_failed("could not send (not connected?)")
+        Requests the Arduino's AUTHORITATIVE live tick count via the `status`
+        command and writes it into THIS row's ENCODER COUNTS field only. The
+        value stays editable (operator can fine-tune before saving). CAPTURE
+        never saves calibration and never touches the live counter. Success:
+        "\u2713 TICK CAPTURED \u2014 LAYER N: <tick> PULSES"; failure (no reply
+        / timeout / link loss): "\u2715 CAPTURE FAILED" and the field is left
+        unchanged.
+        """
+        if idx >= len(self._capture_btns):
             return
-        self._ops[op_kind]["reqs"].add(req_id)
+        if self._capturing[idx]:
+            return  # re-entrancy guard: one in-flight request per row
+        if not self._ensure_serial("CAPTURE"):
+            return
+        layer_pk = idx + 1
+        self._capturing[idx] = True
+        self._capture_btns[idx].setText("\u2026")
+        self._capture_btns[idx].setEnabled(False)
+
+        def _done(_r, data):
+            try:
+                tick = int(data.get("currentTicks"))
+            except (TypeError, ValueError):
+                self._capture_failed(idx, "device reply carried no tick count")
+                return
+            if idx < len(self._capturing):
+                self._capturing[idx] = False
+            self._capture_btns[idx].setText("CAPTURE")
+            self._capture_btns[idx].setEnabled(True)
+            _sbtn, _llbl, pulses_spin, _ft, _cpf, _i = self._cal_rows[idx]
+            pulses_spin.blockSignals(True)
+            pulses_spin.setValue(tick)
+            pulses_spin.blockSignals(False)
+            self._mark_modified(idx)
+            try:
+                self.audit.record(
+                    "CAPTURE_TICK",
+                    f"layer {layer_pk} tick = {tick} (device-confirmed status)",
+                    self.roles.role(), uptime=self.mw.encoder_uptime_s)
+            except Exception:
+                pass
+            self._show_cal_msg(
+                "saved",
+                f"\u2713 TICK CAPTURED \u2014 WRAP {layer_pk}: {tick:} PULSES")
+            self._capture_msg_until = _time.monotonic() + 4.0
+            self.refresh()
+
+        def _fail(_r, reason):
+            self._capture_failed(idx, reason)
+
+        if self._local():
+            # Demo / no-device: the local display's current tick is the best
+            # authoritative source available (there is no Arduino to ask).
+            self._done_local_capture(idx, self.mw.current_ticks)
+            return
+
+        req_id = self.mw._cmd.capture_tick(on_done=_done, on_fail=_fail)
+        if req_id is None:
+            self._capture_failed(idx, "could not send (not connected?)")
+
+    def _done_local_capture(self, idx, tick):
+        layer_pk = idx + 1
+        if idx < len(self._capturing):
+            self._capturing[idx] = False
+        self._capture_btns[idx].setText("CAPTURE")
+        self._capture_btns[idx].setEnabled(True)
+        _sbtn, _llbl, pulses_spin, _ft, _cpf, _i = self._cal_rows[idx]
+        pulses_spin.blockSignals(True)
+        pulses_spin.setValue(int(tick))
+        pulses_spin.blockSignals(False)
+        self._mark_modified(idx)
+        try:
+            self.audit.record(
+                "CAPTURE_TICK",
+                f"layer {layer_pk} tick = {int(tick)} (demo)", self.roles.role())
+        except Exception:
+            pass
+        self._show_cal_msg(
+            "saved",
+            f"\u2713 TICK CAPTURED \u2014 WRAP {layer_pk}: {int(tick):} PULSES")
+        self._capture_msg_until = _time.monotonic() + 4.0
         self.refresh()
 
-    def _on_calibrate(self):
-        # ONE CALIBRATE button (promt3): save the CURRENTLY SELECTED layer's
-        # ENCODER COUNTS + POSITION (FT) to that layer only, then persist. Never
-        # touches the other three layers and never touches the live counter.
-        if not self._ensure_serial("CALIBRATE"):
+    def _capture_failed(self, idx, reason):
+        if idx >= len(self._capture_btns):
             return
-        phase, _d = self._op_phase("set_layer")
-        if phase == "pending":
-            # A previous write is still awaiting device confirmation — never
-            # fire a duplicate request. Give the operator visible feedback
-            # instead of silently doing nothing (promt4).
+        if idx < len(self._capturing):
+            self._capturing[idx] = False
+        self._capture_btns[idx].setText("CAPTURE")
+        self._capture_btns[idx].setEnabled(True)
+        try:
+            self.audit.record(
+                "CAPTURE_TICK",
+                f"layer {idx + 1} FAILED: {reason} (field untouched)",
+                self.roles.role(), uptime=self.mw.encoder_uptime_s)
+        except Exception:
+            pass
+        self._show_cal_msg(
+            "not_saved",
+            f"\u2715 CAPTURE FAILED \u2014 WRAP {idx + 1}: {reason}")
+
+    def _on_calibrate(self):
+        """promt2: CALIBRATE / SAVE ALL LAYERS — validate EVERY row together,
+        then push the COMPLETE configuration to the firmware as one operation.
+
+        Flow: validate all rows -> snapshot the previous confirmed table ->
+        stage each layer (two-stage, auto-confirmed) -> save_calibration
+        (EEPROM) -> load_calibration -> verify ALL rows read back ->
+        "\u2713 CALIBRATION SAVED" + complete config + last-saved time. On ANY
+        failure / rejection / timeout / link loss the success indicator is
+        NEVER shown: "\u2715 CALIBRATION NOT SAVED" and the previous confirmed
+         calibration is restored (rollback) so it stays active.
+        """
+        if not self.roles.at_least(ROLE_SUPERVISOR):
+            return
+        if not self._ensure_serial("CALIBRATE / SAVE ALL WRAPS"):
+            return
+        if self._save_all_active:
+            # Re-entrancy guard — never fire a second all-wraps pipeline.
             self._show_cal_msg(
                 "saving",
-                f"SAVING CALIBRATION \u2014 LAYER {self._selected_row}: awaiting "
-                "device confirmation for a previous request\u2026")
+                "SAVING CALIBRATION \u2014 ALL WRAPS: awaiting device "
+                "confirmation\u2026")
+            return
+        if self._cal_saving_active and self._op_phase("set_layer")[0] == "pending":
+            self._show_cal_msg(
+                "saving",
+                "SAVING CALIBRATION \u2014 awaiting the previous single-wrap "
+                "confirmation\u2026")
             return
 
-        layer_pk = self._selected_row
-        _sbtn, _llbl, pulses_spin, feet_spin, _cpf, _i = self._cal_rows[layer_pk - 1]
-        pulses = int(pulses_spin.value())
-        feet = float(feet_spin.value())
-
-        # Local validation with a clear error message before anything is sent.
-        ok, err = self._validate_layer_input(layer_pk, pulses, feet)
-        if not ok:
-            QMessageBox.warning(self.window(), "Invalid Calibration", err)
-            self._show_cal_msg("error", err)
+        # Validate the complete set BEFORE anything is sent. Every row must be
+        # a configured anchor (feet != 0) and the four anchors must form a
+        # monotonic, duplicate-free set (mirrors the firmware's rules).
+        # Read ALL spinbox values FIRST so pairwise checks use the operator's
+        # complete new table — not stale device values — fixing the false
+        # "disagree on direction" rejection when all layers are edited at once.
+        all_spin = {}     # layer_pk -> (pulses, feet) from the spinbox widgets
+        for i in range(1, FW_MAX_CAL_POINTS + 1):
+            _sbtn, _llbl, p_spin, f_spin, _cpf, _i = self._cal_rows[i - 1]
+            try:
+                p_val = int(p_spin.value())
+            except (TypeError, ValueError):
+                p_val = 0
+            try:
+                f_val = float(f_spin.value())
+            except (TypeError, ValueError):
+                f_val = 0.0
+            all_spin[i] = (p_val, f_val)
+        rows = []          # (layer_pk, pulses, feet) — the complete config
+        errors = []
+        for i in range(1, FW_MAX_CAL_POINTS + 1):
+            pulses, feet = all_spin[i]
+            ok, err = self._validate_layer_input(i, pulses, feet,
+                                                  all_layers=all_spin)
+            if not ok:
+                errors.append(f"  Wrap {i}: {err}")
+            else:
+                rows.append((i, int(pulses), float(feet)))
+        if errors:
+            text = ("\u2715 CALIBRATION NOT SAVED \u2014 INVALID INPUT:\n"
+                    + "\n".join(errors))
+            self._show_cal_msg("error", text)
+            QMessageBox.warning(self.window(), "Invalid Calibration", text)
             return
 
-        self.audit.record("CALIBRATE",
-                          f"layer {layer_pk} pulses = {pulses} feet = {feet:.4f} ft "
-                          f"(CALIBRATE button)",
-                          self.roles.role(), uptime=self.mw.encoder_uptime_s)
-        self._run_calibration_save(layer_pk, pulses, feet, "set_layer")
+        self._save_all_active = True
+        self._cal_editing = False
+        self._ops["save_all"] = {"reqs": set(), "ok": None, "detail": ""}
 
-    def _persist_after_calibrate(self):
-        # After a successful CALIBRATE, persist the table to non-volatile
-        # storage so values survive restart/power cycle (promt3). In real mode
-        # the firmware auto-saves on set_calibration_point; this sends the
-        # explicit save_calibration too so the operator has a guaranteed persist.
+        # Snapshot the PREVIOUS confirmed table (pre-op) for audit + rollback.
+        snapshot = []
+        for i in range(1, FW_MAX_CAL_POINTS + 1):
+            try:
+                cnt = int(self.mw.device.get(f"calCounter{i}", 0) or 0)
+            except (TypeError, ValueError):
+                cnt = 0
+            try:
+                ref = float(self.mw.device.get(f"calPosition{i}", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                ref = 0.0
+            snapshot.append((i, cnt, ref))
+
+        self._show_cal_msg(
+            "saving",
+            f"SAVING CALIBRATION \u2014 ALL WRAPS: {len(rows)} wrap(s) to "
+            f"write, persist and verify\u2026")
+        self._flash_saving(rows[0][0])
+
+        try:
+            self.audit.record(
+                "CALIBRATE_ALL",
+                "requested config: " + self._config_str(rows),
+                self.roles.role(), uptime=self.mw.encoder_uptime_s)
+        except Exception:
+            pass
+
+        # ── LOCAL mode (demo / no device): store is settings.json. ──
         if self._local():
+            for (layer, pulses, feet) in rows:
+                self.mw.device[f"calPosition{layer}"] = feet
+                self.mw.device[f"calCounter{layer}"] = pulses
+            self.mw.device["confirmed"] = True
+            self._recompute_demo_counts_per_foot()
+            self.mw._persist_calibration()
+
+            # Verify persistence by reading the store back from disk (all rows).
+            from scarlet_test_panel.services import settings as settings_service
+            persisted = settings_service.load().get("calibration") or {}
+            for (layer, pulses, feet) in rows:
+                if (int(persisted.get(f"calCounter{layer}", 0) or 0) != int(pulses)
+                        or abs(float(persisted.get(f"calPosition{layer}", 0.0) or 0.0)
+                               - float(feet)) > 1e-6):
+                    self._finish_all_failed(
+                        rows, snapshot,
+                        f"persistence verification failed (wrap {layer} "
+                        f"read back from store)")
+                    return
+            self._finish_all_saved(rows)
             return
-        self._ops.setdefault("save_cal", {"reqs": set(), "ok": None, "detail": ""})
-        req_id = self.mw._cmd.save_calibration(
-            on_done=lambda _r, _d: self._op_ok("save_cal", "calibration saved"),
-            on_fail=lambda _r, reason: self._op_fail("save_cal", reason))
-        if req_id is not None:
-            self._ops["save_cal"]["reqs"].add(req_id)
+
+        # ── REAL mode: firmware is authoritative. Chain stage -> stage -> ──
+        # ── save_calibration (EEPROM) -> load_calibration -> verify.       ──
+        n = len(rows)
+
+        def _stage(idx):
+            if idx >= n:
+                _persist_all(rows)
+                return
+            layer, pulses, feet = rows[idx]
+
+            def _staged(_r, _d):
+                self._show_cal_msg(
+                    "saving",
+                    f"SAVING CALIBRATION \u2014 ALL WRAPS: staged wrap "
+                    f"{idx + 1}/{n} ({int(pulses):} PULSES / "
+                    f"{float(feet):.3f} ft)\u2026")
+                # Pace the next layer so its set_calibration_point has clear air
+                # from the previous ack/report. The serial link drops commands
+                # sent back-to-back (~50% measured) but is ~100% reliable once
+                # ~300ms separates them (firmware_build/pacing_sweep.py).
+                QTimer.singleShot(
+                    CAL_RETRY_DELAY_MS, lambda idx=idx: _stage(idx + 1))
+
+            # Retry same layer on loss/timeout/rejection, then give up.
+            self._stage_retry_send(idx, rows, snapshot, {"used": 0}, _staged)
+
+        def _persist_all(ref_rows):
+            def _persist_done(_r, _d):
+                # EEPROM write acked (ec==0). Re-load and verify ALL rows.
+                self._ops.setdefault("load_cal", {"reqs": set(), "ok": None,
+                                                  "detail": ""})
+
+                def _send_load(on_fail):
+                    rid = self.mw._cmd.load_calibration(
+                        on_done=lambda _r2, data: self._load_all_verify(
+                            ref_rows, snapshot, data),
+                        on_fail=on_fail)
+                    if rid is not None:
+                        self._ops["load_cal"]["reqs"].add(rid)
+                    return rid
+
+                def _load_fail(reason):
+                    self._finish_all_failed(
+                        ref_rows, snapshot,
+                        f"persistence re-load failed: {reason}")
+
+                self._retry_cmd(_send_load, _load_fail)
+
+            def _persist_fail(reason):
+                self._finish_all_failed(
+                    ref_rows, snapshot, f"EEPROM write failed: {reason}")
+
+            self._ops.setdefault("save_cal", {"reqs": set(), "ok": None,
+                                              "detail": ""})
+
+            def _send_save(on_fail):
+                rid = self.mw._cmd.save_calibration(
+                    on_done=_persist_done, on_fail=on_fail)
+                if rid is not None:
+                    self._ops["save_cal"]["reqs"].add(rid)
+                return rid
+
+            self._retry_cmd(_send_save, _persist_fail)
+
+        _stage(0)
+
+    def _stage_retry_send(self, idx, rows, snapshot, attempts, on_staged):
+        """Send one calibration-point stage; retry on loss/timeout/rejection.
+
+        `attempts` is a mutable {"used": int} counter shared across retries so a
+        single genuinely-failing command is retried CAL_SEND_ATTEMPTS times
+        before the pipeline gives up. Used because the serial link intermittently
+        drops command frames (~50% measured), which otherwise surfaces as a
+        spurious "no acknowledge device within 3sec".
+        """
+        layer, pulses, feet = rows[idx]
+        attempts["used"] += 1
+
+        def _retry_or_fail(_r, reason):
+            if attempts["used"] < CAL_SEND_ATTEMPTS:
+                QTimer.singleShot(
+                    CAL_RETRY_DELAY_MS,
+                    lambda: self._stage_retry_send(idx, rows, snapshot,
+                                                   attempts, on_staged))
+            else:
+                self._finish_all_failed(
+                    rows, snapshot, f"wrap {layer} rejected: {reason}")
+
+        rid = self.mw._cmd.set_calibration_point(
+            layer, feet, counter=pulses, on_done=on_staged,
+            on_fail=_retry_or_fail)
+        if rid is not None:
+            self._ops["save_all"]["reqs"].add(rid)
+        else:
+            _retry_or_fail(None, "could not send (not connected?)")
+        self.refresh()
+
+    def _retry_cmd(self, send, on_final_fail,
+                   delay=CAL_RETRY_DELAY_MS, attempts=None):
+        """Run a command send with retry.
+
+        `send(on_fail) -> rid` — a closure that calls a CommandTracker entry
+        point passing our retry callback as on_fail, and returns the req id.
+        Retries up to CAL_SEND_ATTEMPTS on timeout/rejection/link loss before
+        invoking `on_final_fail(reason)`.
+        """
+        attempts = attempts if attempts is not None else {"used": 0}
+        attempts["used"] += 1
+
+        def _retry_or_fail(_r, reason):
+            if attempts["used"] < CAL_SEND_ATTEMPTS:
+                QTimer.singleShot(
+                    delay, lambda: self._retry_cmd(send, on_final_fail,
+                                                   delay, attempts))
+            else:
+                on_final_fail(reason)
+
+        rid = send(_retry_or_fail)
+        if rid is None:
+            _retry_or_fail(None, "could not send (not connected?)")
+
+    def _load_all_verify(self, rows, snapshot, data):
+        # load_calibration echoes the reloaded ACTIVE config; verify EVERY row
+        # reads back exactly what was saved before any success is shown.
+        for (layer, pulses, feet) in rows:
+            got_p = int(data.get(f"calCounter{layer}") or 0)
+            got_f = float(data.get(f"calPosition{layer}") or 0.0)
+            if got_p != int(pulses) or abs(got_f - float(feet)) > 1e-3:
+                self._finish_all_failed(
+                    rows, snapshot,
+                    f"wrap {layer} read back {got_p}/{got_f:.4f} ft instead "
+                    f"of {int(pulses)}/{float(feet):.4f} ft")
+                return
+        self._finish_all_saved(rows)
+
+    def _finish_all_saved(self, rows):
+        # The success indicator is shown ONLY after the firmware confirmed the
+        # write AND verified persistence of the complete configuration.
+        self._save_all_active = False
+        self._cal_dirty = False
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._last_cal_saved_at = now
+        try:
+            from scarlet_test_panel.services import settings as settings_service
+            settings_service.save({"cal_last_saved": now})
+        except Exception:
+            pass
+        self._cal_saved_all = self._save_all_confirmation(rows)
+        self._op_ok("save_all", f"{len(rows)} wrap(s) written + verified")
+        self._show_cal_msg("saved", self._cal_saved_all)
+        if getattr(self, "calibrate_btn", None) is not None:
+            self.calibrate_btn.setText("\u2713  SAVED \u2014 ALL WRAPS")
+            self.calibrate_btn.setStyleSheet(self._calibrate_btn_saved_style())
+            self._cal_save_phase = "saved"
+            self._save_flash_timer.stop()
+            self._save_flash_timer.start(1600)
+        try:
+            self.audit.record(
+                "CALIBRATE_ALL",
+                "SAVED config: " + self._config_str(rows)
+                + " (write + persist + load verified)",
+                self.roles.role(), uptime=self.mw.encoder_uptime_s)
+        except Exception:
+            pass
+        self._refresh_status_line()
+        self.refresh()
+        self._auto_return_to_operator()
+
+    def _finish_all_failed(self, rows, snapshot, reason):
+        # Never show success on a failed all-layers save; keep the previous
+        # confirmed calibration active by rolling the device back to snapshot.
+        self._save_all_active = False
+        self._op_fail("save_all", reason)
+        self._show_cal_msg(
+            "not_saved",
+            f"\u2715 CALIBRATION NOT SAVED \u2014 ALL WRAPS: {reason}")
+        if getattr(self, "calibrate_btn", None) is not None:
+            self.calibrate_btn.setText("\u2715  NOT SAVED")
+            self.calibrate_btn.setStyleSheet(self._calibrate_btn_fail_style())
+            self._cal_save_phase = "failed"
+            self._save_flash_timer.stop()
+            self._save_flash_timer.start(2000)
+        self._rollback_layers(snapshot)
+        try:
+            self.audit.record(
+                "CALIBRATE_ALL",
+                f"FAILED: {reason} — previous config restored",
+                self.roles.role(), uptime=self.mw.encoder_uptime_s)
+        except Exception:
+            pass
+        self._refresh_status_line()
+        self.refresh()
+
+    def _rollback_layers(self, snapshot):
+        """Roll the DEVICE back to the pre-op confirmed table after a failed
+        all-layers save. Runs each snapshot row sequentially (single staged-op
+        slot contract: a stage must be confirmed before the next is staged),
+        then persists. Rows that were previously unconfigured are cleared
+        rather than set to a 0-position anchor (which the firmware rejects)."""
+        if self._local():
+            for (i, c, f) in snapshot:
+                self.mw.device[f"calCounter{i}"] = c
+                self.mw.device[f"calPosition{i}"] = f
+            self._recompute_demo_counts_per_foot()
+            self.mw._persist_calibration()
+            return
+
+        steps = []
+        for (layer, cnt, feet) in snapshot:
+            if int(cnt) == 0 and abs(float(feet)) < 1e-9:
+                steps.append(("clear", layer))
+            else:
+                steps.append(("set", layer, cnt, feet))
+        steps.append(("save",))
+
+        def _next(i):
+            if i >= len(steps):
+                return
+            step = steps[i]
+            if step[0] == "clear":
+                rid = self.mw._cmd.clear_calibration_point(
+                    step[1], on_done=lambda _r, _d: _next(i + 1),
+                    on_fail=lambda _r, _z: _next(i + 1))
+            elif step[0] == "set":
+                rid = self.mw._cmd.set_calibration_point(
+                    step[1], float(step[3]), counter=int(step[2]),
+                    on_done=lambda _r, _d: _next(i + 1),
+                    on_fail=lambda _r, _z: _next(i + 1))
+            else:
+                rid = self.mw._cmd.save_calibration(
+                    on_done=lambda _r, _d: _next(i + 1),
+                    on_fail=lambda _r, _z: _next(i + 1))
+            if rid is None:
+                _next(i + 1)  # write failed — move on; nothing more we can do
+
+        _next(0)
+
+    def _config_str(self, rows):
+        return "; ".join(
+            f"Wrap {l}={c} cnt/{f:.4f} ft" for (l, c, f) in rows)
+
+    def _save_all_confirmation(self, rows):
+        # The prominent green banner showing the COMPLETE saved configuration
+        # plus the last save time — the operator must see every wrap's
+        # PULSES / FEET, not a generic "saved" note.
+        lines = ["\u2713 CALIBRATION SAVED \u2014 ALL WRAPS:"]
+        for (layer, pulses, feet) in rows:
+            lines.append(f"  Wrap {layer}: {int(pulses):} PULSES / "
+                         f"{float(feet):.3f} ft")
+        if self._last_cal_saved_at:
+            lines.append(f"Last saved: {self._last_cal_saved_at}")
+        return "\n".join(lines)
 
     # ––––––––––––––––––––– RESET COUNTER –––––––––––––––––──────────────
     def _on_reset(self):
@@ -1212,7 +2336,7 @@ class BlockPositionTab(QWidget):
         reply = self._confirm_reset_dialog(
             "Confirm Reset",
             f"Reset the counter to 0?\n\n"
-            f"Current: {pre_feet:,.3f} ft  ({pre_ticks:,} ticks)\n\n"
+            f"Current: {pre_feet:.3f} ft  ({pre_ticks:} ticks)\n\n"
             "The counter reads 0 while the block stays at the same physical "
             "position (a runtime reference preserves the reading).\n"
             "The calibration table is NOT modified or re-saved.\n"
@@ -1234,10 +2358,12 @@ class BlockPositionTab(QWidget):
             # sample, so no calibration table is shifted here either).
             self.mw.current_ticks = 0
             self.mw.device["currentTicks"] = 0
+            self.mw._derive_direction(0)
             self.mw._set_reset_state(
                 True, "RESET SUCCESSFUL — counter zeroed (demo)")
             self._op_ok("reset", "counter zeroed (demo); calibration unchanged")
             self.refresh()
+            self._auto_return_to_operator()
             return
 
         self._ops["reset"] = {"reqs": set(), "ok": None, "detail": ""}
@@ -1269,11 +2395,11 @@ class BlockPositionTab(QWidget):
     # ––––––––––––––––––––– RESET FEET –––––––––––––––––──────────────
     def _on_reset_feet(self):
         # RESET FEET resets ONLY the CURRENT RUNTIME position: tick=0,
-        # position=0.00 ft, velocity=0, direction=STOPPED. It NEVER touches the
+        # position=0.00 ft, velocity=0. It NEVER touches the
         # calibration table (anchors, saved pulses/feet) or recalibrates.
         if not self.roles.at_least(ROLE_SUPERVISOR):
             return
-        if not self._ensure_serial("RESET FEET"):
+        if not self._ensure_serial("RESET POSITION"):
             return
         phase, _d = self._op_phase("reset_feet")
         if phase == "pending":
@@ -1281,64 +2407,79 @@ class BlockPositionTab(QWidget):
 
         pre_ticks = self.mw.current_ticks
         pre_feet = self.mw.block_position_ft
-        reply = self._confirm_reset_dialog(
-            "Confirm Reset Feet",
-            f"Reset the runtime position reference?\n\n"
-            f"Current: {pre_feet:,.3f} ft  ({pre_ticks:,} ticks)\n\n"
-            "Sets Encoder Tick = 0, Block Position = 0.00 FT, "
-            "Velocity = 0.00 FT/MIN, Direction = STOPPED.\n"
-            "The saved calibration table is NOT modified.")
-        if not reply:
-            return
+        start_ft = self._prompt_starting_ft()
+        if start_ft is None:
+            return  # CANCEL — change nothing
 
         self.audit.record("RESET_FEET",
                           f"reset feet requested (pre-reset ticks={pre_ticks}, "
-                          f"position={pre_feet:.3f} ft) — calibration untouched",
+                          f"position={pre_feet:.3f} ft -> new start={start_ft:.3f} ft) "
+                          f"— calibration untouched",
                           self.roles.role(), uptime=self.mw.encoder_uptime_s)
         self.mw.encoder_recovered = False
         self._reset_banner(False)
 
         if self._local():
-            # Demo / no-device: apply the runtime zero reference directly.
-            # CRITICAL: do NOT re-base or persist calibration here — RESET FEET
-            # leaves the calibration table completely unchanged.
+            # Demo / no-device: apply the new starting position reference
+            # directly. CRITICAL: do NOT re-base or persist calibration here —
+            # RESET FEET leaves the calibration table completely unchanged.
+            # Anchor the runtime reference to tick 0 (the reset datum) so the
+            # simulated block reads `start_ft` AT tick 0 and then CONTINUES to
+            # travel along the calibration — it must never sit frozen at the
+            # datum after a reset.
+            pts = self.mw.cal_points()
+            base_abs = self.mw.calibrated_position(0)
+            if base_abs is None:
+                base_abs = pts[0][1] if pts else 0.0
+            self.mw.set_runtime_reference(base_abs, start_ft)
             self.mw.current_ticks = 0
             self.mw.device["currentTicks"] = 0
-            self.mw._set_block_position(0.0)
-            self.mw.device["blockPositionFt"] = 0.0
+            # Rewind the demo cycle to its boundary so the next demo tick
+            # starts from tick 0 == start_ft and the block keeps moving.
+            self.mw._demo_counter = 59
+            self.mw._demo_prev_pos = start_ft
+            self.mw._derive_direction(0)
+            self.mw._set_block_position(start_ft)
+            self.mw.device["blockPositionFt"] = start_ft
             self.mw.velocity_ft_min = 0.0
             self.mw.device["velocityFtMin"] = 0.0
-            self.mw.direction = "STOPPED"
-            self.mw.device["direction"] = "STOPPED"
+            self.mw.current_layer = layers_service.derive_layer(
+                self.mw.current_ticks, [p[0] for p in self.mw.cal_points()])
             self.mw._set_reset_state(
-                True, "RESET FEET SUCCESSFUL — Encoder Tick: 0   "
-                      "Block Position: 0.00 FT")
-            self._op_ok("reset_feet", "runtime zeroed; calibration unchanged")
+                True, f"STARTING POSITION RESET SUCCESSFULLY — "
+                      f"New Starting Position: {start_ft:.2f} FT")
+            self._ops["reset_feet"] = {"reqs": set(), "ok": None, "detail": ""}
+            self._op_ok("reset_feet",
+                        f"new start {start_ft:.3f} ft; calibration unchanged")
             self.refresh()
+            self._auto_return_to_operator()
             return
 
         self._ops["reset_feet"] = {"reqs": set(), "ok": None, "detail": ""}
 
         def on_reset_feet_done(_r, _d):
-            self._op_ok("reset_feet", "runtime zeroed; calibration unchanged")
+            self._op_ok("reset_feet",
+                        f"start {start_ft:.3f} ft confirmed; calibration unchanged")
+            self._auto_return_to_operator()
             # Success banner driven via consume_reset_state on reset_feet_ack.
 
         def on_reset_feet_fail(_r, reason):
             self._op_fail("reset_feet", reason)
-            self.mw._set_reset_state(False, f"RESET FEET FAILED — {reason}")
+            self.mw._set_reset_state(False, f"RESET POSITION FAILED — {reason}")
 
         req_id = self.mw._cmd.reset_feet(
+            start_ft=start_ft,
             on_done=on_reset_feet_done,
             on_fail=on_reset_feet_fail)
         if req_id is None:
             self._op_fail("reset_feet", "could not send (not connected?)")
             self.mw._set_reset_state(
-                False, "RESET FEET FAILED — could not send (not connected?)")
+                False, "RESET POSITION FAILED — could not send (not connected?)")
             return
         self._ops["reset_feet"]["reqs"].add(req_id)
         if hasattr(self, "reset_feet_btn"):
             self.reset_feet_btn.setEnabled(False)
-            self.reset_feet_btn.setText("RESET FEET PENDING…")
+            self.reset_feet_btn.setText("RESET POSITION PENDING…")
         self.refresh()
 
     # ––––––––––––––––––––– SET LAYER –––––––––––––––––──────────────
@@ -1346,7 +2487,9 @@ class BlockPositionTab(QWidget):
         # The calibration table IS the input: the selected row's ENCODER COUNTS
         # (encoder counter anchor) and POSITION (FT) (position anchor) are read
         # straight from the editable cells and pushed to the firmware.
-        if not self._ensure_serial("SET LAYER"):
+        if not self.roles.at_least(ROLE_SUPERVISOR):
+            return
+        if not self._ensure_serial("SET WRAP"):
             return
         phase, _d = self._op_phase("set_layer")
         if phase == "pending":
@@ -1365,6 +2508,8 @@ class BlockPositionTab(QWidget):
 
     # ––––––––––––––––––––– SET BLOCK HEIGHT –––––––––––––––––─────────
     def _on_set_block_height(self):
+        if not self.roles.at_least(ROLE_SUPERVISOR):
+            return
         if not self._ensure_serial("SET BLOCK HEIGHT"):
             return
         phase, _d = self._op_phase("set_height")
@@ -1378,19 +2523,19 @@ class BlockPositionTab(QWidget):
         cur = self.mw.block_position_ft
         cur_cnt = int(self.mw.device.get(f"calCounter{layer_pk}", 0) or 0)
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Set Block Height — Layer {layer_pk}")
+        dlg.setWindowTitle(f"Set Block Height — Wrap {layer_pk}")
         form = QFormLayout(dlg)
         hint = QLabel(
             f"Tell the system: “the block is currently at this known physical "
-            f"position, on layer {layer_pk}.” Either capture the live counter "
-            f"as the anchor for that layer, or enter the counter manually.")
+            f"position, on wrap {layer_pk}.” Either capture the live counter "
+            f"as the anchor for that wrap, or enter the counter manually.")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color:{TEXT_MID.name()}; font-family:'Segoe UI'; font-size:10px;")
         form.addRow(hint)
         spin = self._spins(value=cur)
-        form.addRow(f"Layer {layer_pk} position (ft):", spin)
+        form.addRow(f"Wrap {layer_pk} position (ft):", spin)
         cnt_widget, get_counter = self._counter_row(cur_cnt)
-        form.addRow(f"Encoder counter (live now: {self.mw.current_ticks:,}):", cnt_widget)
+        form.addRow(f"Encoder counter (live now: {self.mw.current_ticks:}):", cnt_widget)
         form.addRow(self._ok_cancel_dialog(dlg))
         if dlg.exec_() != QDialog.Accepted:
             return
@@ -1443,12 +2588,14 @@ class BlockPositionTab(QWidget):
             self.mw._persist_calibration()
             self._op_ok("set_wits", f"WITS correction = {value:.4f} ft (demo)")
             self.refresh()
+            self._auto_return_to_operator()
             return
 
         req_id = self.mw._cmd.set_wits_correction(
             value,
-            on_done=lambda _r, _d: self._op_ok(
+            on_done=lambda _r, _d: (self._op_ok(
                 "set_wits", f"WITS correction = {value:.4f} ft"),
+                self._auto_return_to_operator()),
             on_fail=lambda _r, reason: self._op_fail("set_wits", reason))
         if req_id is None:
             self._op_fail("set_wits", "could not send (not connected?)")
@@ -1462,7 +2609,7 @@ class BlockPositionTab(QWidget):
         # RESET COUNTER. Deleting a level never touches the live encoder counter.
         if not self.roles.at_least(ROLE_SUPERVISOR):
             return
-        if not self._ensure_serial("DELETE LEVEL"):
+        if not self._ensure_serial("DELETE WRAP"):
             return
         phase, _d = self._op_phase("delete_level")
         if phase == "pending":
@@ -1472,14 +2619,14 @@ class BlockPositionTab(QWidget):
         cur = float(self.mw.device.get(f"calPosition{layer_pk}", 0.0) or 0.0)
         if cur == 0.0:
             QMessageBox.information(
-                self.window(), "Delete Level",
-                f"Layer {layer_pk} has no calibration anchor to delete.")
+                self.window(), "Delete Wrap",
+                f"Wrap {layer_pk} has no calibration anchor to delete.")
             return
         ret = QMessageBox.question(
-            self.window(), "Delete Level",
-            f"Delete the calibration anchor for Layer {layer_pk}?\n"
-            f"(counter {int(self.mw.device.get(f'calCounter{layer_pk}', 0) or 0):,} "
-            f"→ {cur:,.3f} ft).\n\nThe live encoder counter is NOT affected.",
+            self.window(), "Delete Wrap",
+            f"Delete the calibration anchor for Wrap {layer_pk}?\n"
+            f"(counter {int(self.mw.device.get(f'calCounter{layer_pk}', 0) or 0):} "
+            f"→ {cur:.3f} ft).\n\nThe live encoder counter is NOT affected.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if ret != QMessageBox.Yes:
             return
@@ -1487,7 +2634,7 @@ class BlockPositionTab(QWidget):
         self.audit.record("DELETE_CALIBRATION_POINT",
                           f"delete layer {layer_pk} anchor "
                           f"(counter {int(self.mw.device.get(f'calCounter{layer_pk}', 0) or 0)}, "
-                          f"{cur:,.3f} ft)",
+                          f"{cur:.3f} ft)",
                           self.roles.role(), uptime=self.mw.encoder_uptime_s)
         self._ops["delete_level"] = {"reqs": set(), "ok": None, "detail": ""}
 
@@ -1497,14 +2644,16 @@ class BlockPositionTab(QWidget):
             self.mw.device["confirmed"] = True
             self._recompute_demo_counts_per_foot()
             self.mw._persist_calibration()
-            self._op_ok("delete_level", f"layer {layer_pk} anchor deleted (demo)")
+            self._op_ok("delete_level", f"wrap {layer_pk} anchor deleted (demo)")
             self.refresh()
+            self._auto_return_to_operator()
             return
 
         req_id = self.mw._cmd.clear_calibration_point(
             layer_pk,
-            on_done=lambda _r, _d: self._op_ok(
-                "delete_level", f"layer {layer_pk} anchor deleted"),
+            on_done=lambda _r, _d: (self._op_ok(
+                "delete_level", f"wrap {layer_pk} anchor deleted"),
+                self._auto_return_to_operator()),
             on_fail=lambda _r, reason: self._op_fail("delete_level", reason))
         if req_id is None:
             self._op_fail("delete_level", "could not send (not connected?)")
@@ -1544,7 +2693,7 @@ class BlockPositionTab(QWidget):
         pol.addItem("-1  (counter up = block DOWN)", -1)
         pol.setCurrentIndex(0 if cur == 1 else 1)
         pol.setStyleSheet(
-            f"QComboBox {{ background:{BG_INNER.name()}; color:{TEXT_DARK.name()}; "
+            f"QComboBox {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()}; "
             f"border:1px solid {BORDER.name()}; border-radius:6px; padding:6px; }}")
         form.addRow("Polarity:", pol)
         form.addRow(self._ok_cancel_dialog(dlg))
@@ -1563,12 +2712,14 @@ class BlockPositionTab(QWidget):
             self.mw._persist_calibration()
             self._op_ok("set_polarity", f"polarity = {polarity:+d} (demo)")
             self.refresh()
+            self._auto_return_to_operator()
             return
 
         req_id = self.mw._cmd.set_encoder_polarity(
             polarity,
-            on_done=lambda _r, _d: self._op_ok(
+            on_done=lambda _r, _d: (self._op_ok(
                 "set_polarity", f"polarity = {polarity:+d}"),
+                self._auto_return_to_operator()),
             on_fail=lambda _r, reason: self._op_fail("set_polarity", reason))
         if req_id is None:
             self._op_fail("set_polarity", "could not send (not connected?)")
@@ -1578,6 +2729,8 @@ class BlockPositionTab(QWidget):
 
     # ––––––––––––––––––––– SAVE / LOAD CALIBRATION –––––––––––––––––─
     def _on_save_calibration(self):
+        if not self.roles.at_least(ROLE_SUPERVISOR):
+            return
         if not self._ensure_serial("SAVE CALIBRATION"):
             return
         phase, _d = self._op_phase("save_cal")
@@ -1589,6 +2742,7 @@ class BlockPositionTab(QWidget):
             self.mw._persist_calibration()
             self._op_ok("save_cal", "calibration saved (demo)")
             self.refresh()
+            self._auto_return_to_operator()
             return
 
         def _on_saved(_req, _data):
@@ -1596,6 +2750,7 @@ class BlockPositionTab(QWidget):
             # it survives restart/reload and stays the single source of truth.
             self.mw._persist_calibration()
             self._op_ok("save_cal", "calibration saved")
+            self._auto_return_to_operator()
 
         req_id = self.mw._cmd.save_calibration(
             on_done=_on_saved,
@@ -1607,6 +2762,8 @@ class BlockPositionTab(QWidget):
         self.refresh()
 
     def _on_load_calibration(self):
+        if not self.roles.at_least(ROLE_SUPERVISOR):
+            return
         if not self._ensure_serial("LOAD SAVED CALIBRATION"):
             return
         phase, _d = self._op_phase("load_cal")
@@ -1625,9 +2782,11 @@ class BlockPositionTab(QWidget):
                 self._cal_editing = False
                 self._cal_dirty = False
                 self._last_saved = None
+                self._cal_saved_all = None
                 self._op_ok("load_cal", "saved calibration loaded (demo)")
                 self._show_cal_msg(
                     "saved", "SAVED CALIBRATION LOADED — now active.")
+                self._auto_return_to_operator()
             else:
                 self._op_fail("load_cal", "no saved calibration found (demo)")
                 self._show_cal_msg("error",
@@ -1636,7 +2795,14 @@ class BlockPositionTab(QWidget):
             return
 
         req_id = self.mw._cmd.load_calibration(
-            on_done=lambda _r, _d: self._op_ok("load_cal", "calibration loaded"),
+            on_done=lambda _r, _d: (
+                setattr(self, "_cal_editing", False),
+                setattr(self, "_cal_dirty", False),
+                setattr(self, "_last_saved", None),
+                setattr(self, "_cal_saved_all", None),
+                self._op_ok("load_cal", "calibration loaded"),
+                self._auto_return_to_operator(),
+                self.refresh()),
             on_fail=lambda _r, reason: self._op_fail("load_cal", reason))
         if req_id is None:
             self._op_fail("load_cal", "could not send (not connected?)")
@@ -1668,7 +2834,514 @@ class BlockPositionTab(QWidget):
                 return idx
         return 0
 
+    # ––––––––––––––––––––– FT/M display toggle (promt1.txt) –––––──
+    # The internal block position is ALWAYS in FEET (block_position_ft).
+    # METERS is DISPLAY ONLY: meters = feet x 0.3048. Switching units never
+    # converts back, rescales, resets or touches encoder/calibration/layer.
+    def _on_unit_toggle(self):
+        """Toggle the Block Position display unit between FT and M."""
+        self._position_unit = "FT" if self._position_unit == "M" else "M"
+        self.update_block_position_display()
+        # Bit machine first (see refresh): String Length must read the
+        # committed bit depth of this update.
+        self.update_bit_screen_display()
+        self.update_string_length_display()
+
+    def _on_save_pipe_in_hole(self):
+        """Save the Pipe in Hole value (promt.txt). Engineer-only.
+        Validates input, persists to settings, refreshes String Length."""
+        if not self.roles.at_least(ROLE_SUPERVISOR):
+            return
+        value = self.pipe_in_hole_spin.value()
+        if value < 0.0:
+            self.pih_msg_lbl.setText("Value must not be negative.")
+            self.pih_msg_lbl.setStyleSheet(
+                f"color:{FAULT_BG}; background:transparent; "
+                "font-family:'Segoe UI'; font-size:11px; font-weight:bold;")
+            return
+        ok = self.mw.set_pipe_in_hole(value)
+        if ok:
+            self.pih_msg_lbl.setText(
+                f"✓ PIPE IN HOLE SAVED — {value:.2f} FT")
+            self.pih_msg_lbl.setStyleSheet(
+                f"color:{NORMAL_BG}; background:transparent; "
+                "font-family:'Segoe UI'; font-size:11px; font-weight:bold;")
+            try:
+                self.audit.record(
+                    "PIPE_IN_HOLE",
+                    f"pipe in hole set to {value:.2f} ft",
+                    self.roles.role(), uptime=self.mw.encoder_uptime_s)
+            except Exception:
+                pass
+            self._auto_return_to_operator()
+            self.refresh()
+        else:
+            self.pih_msg_lbl.setText("Invalid input — enter a numeric value.")
+            self.pih_msg_lbl.setStyleSheet(
+                f"color:{FAULT_BG}; background:transparent; "
+                "font-family:'Segoe UI'; font-size:11px; font-weight:bold;")
+
+    def _on_save_slip_window(self):
+        """Save the Slip Window Load (k-lb) + Time (seconds) (slip_window.txt).
+        Engineer-only. Validates input, persists to settings, refreshes the
+        readouts and advances the running confirmation state."""
+        if not self.roles.at_least(ROLE_SUPERVISOR):
+            return
+        load_val = self.slip_window_load_spin.value()
+        time_val = self.slip_window_time_spin.value()
+        if load_val < 0.0:
+            self.slip_msg_lbl.setText("Load must not be negative.")
+            self.slip_msg_lbl.setStyleSheet(
+                f"color:{FAULT_BG}; background:transparent; "
+                "font-family:'Segoe UI'; font-size:11px; font-weight:bold;")
+            return
+        if time_val <= 0.0:
+            self.slip_msg_lbl.setText("Time must be greater than 0.")
+            self.slip_msg_lbl.setStyleSheet(
+                f"color:{FAULT_BG}; background:transparent; "
+                "font-family:'Segoe UI'; font-size:11px; font-weight:bold;")
+            return
+        ok_load = self.mw.set_slip_window_load(load_val)
+        ok_time = self.mw.set_slip_window_time(time_val)
+        if ok_load and ok_time:
+            self.slip_msg_lbl.setText(
+                f"✓ SLIP WINDOW SAVED — {load_val:.2f} k-lb / {time_val:.2f} sec")
+            self.slip_msg_lbl.setStyleSheet(
+                f"color:{NORMAL_BG}; background:transparent; "
+                "font-family:'Segoe UI'; font-size:11px; font-weight:bold;")
+            try:
+                self.audit.record(
+                    "SLIP_WINDOW",
+                    f"slip window load {load_val:.2f} k-lb / time {time_val:.2f} sec",
+                    self.roles.role(), uptime=self.mw.encoder_uptime_s)
+            except Exception:
+                pass
+            self._auto_return_to_operator()
+            self.refresh()
+        else:
+            self.slip_msg_lbl.setText("Invalid input — enter numeric values.")
+            self.slip_msg_lbl.setStyleSheet(
+                f"color:{FAULT_BG}; background:transparent; "
+                "font-family:'Segoe UI'; font-size:11px; font-weight:bold;")
+
+    def _readout_available_width(self):
+        """Usable width of one readout section, in pixels."""
+        vp = self._readout_viewport
+        if vp is None:
+            return 0
+        # The section is a QGroupBox inside the scrollable page: the usable
+        # width is the visible viewport minus the page margins and the section
+        # frame.
+        page = getattr(self, "_readout_scroll", None)
+        page = page.widget() if page is not None else None
+        chrome = READOUT_PAGE_MARGIN
+        if page is not None and page.layout() is not None:
+            m = page.layout().contentsMargins()
+            chrome += m.left() + m.right()
+        return max(0, vp.width() - chrome)
+
+    def _readout_column_count(self, available):
+        """How many equal columns fit, like the Dashboard value table."""
+        if available <= 0:
+            return 1
+        for cols in range(READOUT_MAX_COLUMNS, 0, -1):
+            need = cols * READOUT_MIN_CELL_W + (cols - 1) * READOUT_GAP
+            if available >= need:
+                return cols
+        return 1
+
+    def _relayout_readout(self, force=False):
+        """Give every value cell the width of one responsive column.
+
+        The column count follows the visible width (5 -> 4 -> 3 -> 2 -> 1, like
+        the Dashboard drilling monitor) and every cell gets that width, so the
+        FlowLayout of a section wraps them into full equal rows. The cells of a
+        short last row are widened so the table always reaches the right edge
+        and no horizontal scrollbar is needed. The widths are only touched
+        when the column count changes, so it is safe to call on every resize.
+        """
+        rows = getattr(self, "_readout_rows", None)
+        if not rows:
+            return
+        available = self._readout_available_width()
+        if available <= 0:
+            return
+        widest = max(len(cells) for _sec, _flow, cells in rows)
+        if not widest:
+            return
+        cols = min(self._readout_column_count(available), widest)
+        if not force and cols == self._readout_columns:
+            return
+        self._readout_columns = cols
+        cell_w = (available - (cols - 1) * READOUT_GAP) // cols
+        for _sec, _flow, cells in rows:
+            self._place_readout_row(cells, cols, cell_w)
+
+    @staticmethod
+    def _place_readout_row(cells, cols, cell_w):
+        """Size the cells of one section: equal columns, filled last row."""
+        n = len(cells)
+        for start in range(0, n, cols):
+            chunk = cells[start:start + cols]
+            m = len(chunk)
+            # A short last row spreads over the remaining width so the table
+            # never leaves a hole on the right.
+            width = cell_w if m == cols else (
+                cell_w * cols - (cols - m) * READOUT_GAP) // m
+            for cell in chunk:
+                if cell.width() != width:
+                    cell.setFixedWidth(width)
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "_readout_viewport", None) and event.type() == QEvent.Resize:
+            self._relayout_readout()
+        return super().eventFilter(obj, event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # The tab is usually built while hidden, so the first real layout
+        # happens here; place the table once the viewport has its real width.
+        QTimer.singleShot(0, lambda: self._relayout_readout(force=True))
+
+    def _build_bit_screen(self, card):
+        """Populate a small always-visible "screen" card that shows the LIVE
+        BIT POSITION (the bit's depth) in the same dark LCD style."""
+        bv = QVBoxLayout(card)
+        bv.setContentsMargins(8, 4, 8, 4)
+        bv.setSpacing(4)
+        screen = QFrame()
+        screen.setFrameShape(QFrame.StyledPanel)
+        screen.setStyleSheet(
+            "QFrame { background:#141B24; border:2px solid #3A4B5C; "
+            "border-radius:10px; }")
+        sbox = QVBoxLayout()
+        sbox.setSpacing(2)
+        sbox.setContentsMargins(6, 3, 6, 4)
+        self.bit_screen_cap = QLabel("BIT POSITION (FT)")
+        self.bit_screen_cap.setAlignment(Qt.AlignCenter)
+        self.bit_screen_cap.setStyleSheet(
+            f"color:{TEXT_LITE.name()}; font-family:'Segoe UI'; font-size:9px; "
+            "letter-spacing:2px; background:transparent;")
+        sbox.addWidget(self.bit_screen_cap)
+        self.bit_screen_lbl = QLabel("--")
+        self.bit_screen_lbl.setAlignment(Qt.AlignCenter)
+        self.bit_screen_lbl.setStyleSheet(
+            "color:#47E08A; font-family:'Consolas'; font-size:22px; "
+            "font-weight:bold; background:transparent;")
+        sbox.addWidget(self.bit_screen_lbl)
+        self.bit_screen_sub_lbl = QLabel("")
+        self.bit_screen_sub_lbl.setAlignment(Qt.AlignCenter)
+        self.bit_screen_sub_lbl.setStyleSheet(
+            "color:#9FB6C9; font-family:'Consolas'; font-size:9px; "
+            "background:transparent;")
+        sbox.addWidget(self.bit_screen_sub_lbl)
+        screen.setLayout(sbox)
+        bv.addWidget(screen)
+
+    def update_bit_screen_display(self):
+        """Live BIT POSITION screen (promt.txt, hookload-conditioned). The bit
+        only moves while pipe load is proven (the live channel-0 Hookload, or
+        the Slip Window confirmation when enabled): it is driven by the ACTUAL
+        block delta (New Bit = Previous Bit - Block Delta, re-anchored on every
+        pipe-load engagement), moving OPPOSITE to the block while String Length
+        = Block + Bit stays constant. Without pipe load the depth HOLDS at the
+        last valid value, so small block movement / sensor noise never creeps
+        it. Feet internally; shown in the selected FT / M display unit."""
+        unit = self._position_unit if self._position_unit in ("FT", "M") else "FT"
+        self.bit_screen_cap.setText(f"BIT POSITION ({unit})")
+        if self.mw.pipe_in_hole_ft is None:
+            self.bit_screen_lbl.setText("--")
+            self.bit_screen_sub_lbl.setText("set pipe in hole")
+            return
+        bit_ft = self.mw.bit_position_ft
+        state = self.mw.bit_position_state
+        if bit_ft is None:
+            self.bit_screen_lbl.setText("--")
+            self.bit_screen_lbl.setStyleSheet(
+                "color:#9FB6C9; font-family:'Consolas'; font-size:22px; "
+                "font-weight:bold; background:transparent;")
+            self.bit_screen_sub_lbl.setText("● HOLD — no pipe load yet")
+            return
+        value = float(bit_ft) * FT_TO_M if unit == "M" else float(bit_ft)
+        self.bit_screen_lbl.setText(f"{value:.2f}")
+        self.bit_screen_lbl.setStyleSheet(
+            ("color:#47E08A;" if state == "TRACK" else "color:#E8C15A;")
+            + " font-family:'Consolas'; font-size:22px; "
+            + "font-weight:bold; background:transparent;")
+        bp = float(self.mw.block_position_ft or 0.0)
+        pih = float(self.mw.pipe_in_hole_ft or 0.0)
+        tag = "TRACKING" if state == "TRACK" else "HOLD"
+        self.bit_screen_sub_lbl.setText(
+            f"Block {bp:.1f} ft  ·  Pipe in Hole {pih:.1f} ft  ·  {tag}")
+
+    def _build_hole_depth_screen(self, card):
+        """Populate a small always-visible "screen" card that shows the HOLE
+        DEPTH (the deepest Bit Position reached — accumulated, non-decreasing)
+        in the same dark LCD style as the BIT POSITION screen."""
+        hdv = QVBoxLayout(card)
+        hdv.setContentsMargins(8, 4, 8, 4)
+        hdv.setSpacing(4)
+        screen = QFrame()
+        screen.setFrameShape(QFrame.StyledPanel)
+        screen.setStyleSheet(
+            "QFrame { background:#141B24; border:2px solid #3A4B5C; "
+            "border-radius:10px; }")
+        sbox = QVBoxLayout()
+        sbox.setSpacing(2)
+        sbox.setContentsMargins(6, 3, 6, 4)
+        self.hole_depth_screen_cap = QLabel("HOLE DEPTH (FT)")
+        self.hole_depth_screen_cap.setAlignment(Qt.AlignCenter)
+        self.hole_depth_screen_cap.setStyleSheet(
+            f"color:{TEXT_LITE.name()}; font-family:'Segoe UI'; font-size:9px; "
+            "letter-spacing:2px; background:transparent;")
+        sbox.addWidget(self.hole_depth_screen_cap)
+        self.hole_depth_screen_lbl = QLabel("--")
+        self.hole_depth_screen_lbl.setAlignment(Qt.AlignCenter)
+        self.hole_depth_screen_lbl.setStyleSheet(
+            "color:#47E08A; font-family:'Consolas'; font-size:22px; "
+            "font-weight:bold; background:transparent;")
+        sbox.addWidget(self.hole_depth_screen_lbl)
+        self.hole_depth_screen_sub_lbl = QLabel("")
+        self.hole_depth_screen_sub_lbl.setAlignment(Qt.AlignCenter)
+        self.hole_depth_screen_sub_lbl.setStyleSheet(
+            "color:#9FB6C9; font-family:'Consolas'; font-size:9px; "
+            "background:transparent;")
+        sbox.addWidget(self.hole_depth_screen_sub_lbl)
+        screen.setLayout(sbox)
+        hdv.addWidget(screen)
+
+    def update_hole_depth_display(self):
+        """Live HOLE DEPTH screen (promt.txt): the deepest Bit Position the
+        string has reached — an accumulated running maximum that never
+        decreases. It reads the live bit_position_ft every tick (so the bit
+        state machine advances in step), then keeps the highest value: the
+        depth HOLDS while tripping / coming out of the hole and only advances
+        again when the bit runs deeper. Feet internally; shown in the
+        selected FT / M display unit."""
+        unit = self._position_unit if self._position_unit in ("FT", "M") else "FT"
+        self.hole_depth_screen_cap.setText(f"HOLE DEPTH ({unit})")
+        hd_ft = self.mw.hole_depth_ft
+        if hd_ft is None:
+            self.hole_depth_screen_lbl.setText("--")
+            self.hole_depth_screen_sub_lbl.setText("set pipe in hole")
+            return
+        value = float(hd_ft) * FT_TO_M if unit == "M" else float(hd_ft)
+        self.hole_depth_screen_lbl.setText(f"{value:.2f}")
+        # Status line: whether the current bit still matches the deepest depth
+        # (at bottom) or is shallower (tripping / about to go back in). Uses
+        # the bit recorded by bit_position_ft this tick — never re-reads the
+        # property (which would re-advance the bit state machine).
+        current_bit = self.mw.hole_last_bit_ft
+        if current_bit is None or float(current_bit) >= float(hd_ft) - 1e-9:
+            self.hole_depth_screen_sub_lbl.setText("● AT MAX DEPTH")
+        else:
+            self.hole_depth_screen_sub_lbl.setText("● HOLDS - TRIPPING")
+
+    def _build_bottom_screen(self, card):
+        """Populate an always-visible "screen" card that shows whether the
+        string is ON BOTTOM (the live bit position equals the deepest depth
+        reached) or OFF BOTTOM (the bit is shallower — tripping / about to go
+        back in), in the same dark LCD style as the BIT POSITION screen."""
+        btv = QVBoxLayout(card)
+        btv.setContentsMargins(8, 4, 8, 4)
+        btv.setSpacing(4)
+        screen = QFrame()
+        screen.setFrameShape(QFrame.StyledPanel)
+        screen.setStyleSheet(
+            "QFrame { background:#141B24; border:2px solid #3A4B5C; "
+            "border-radius:10px; }")
+        sbox = QVBoxLayout()
+        sbox.setSpacing(2)
+        sbox.setContentsMargins(6, 3, 6, 4)
+        self.bottom_screen_cap = QLabel("STRING STATE")
+        self.bottom_screen_cap.setAlignment(Qt.AlignCenter)
+        self.bottom_screen_cap.setStyleSheet(
+            f"color:{TEXT_LITE.name()}; font-family:'Segoe UI'; font-size:9px; "
+            "letter-spacing:2px; background:transparent;")
+        sbox.addWidget(self.bottom_screen_cap)
+        self.bottom_screen_lbl = QLabel("--")
+        self.bottom_screen_lbl.setAlignment(Qt.AlignCenter)
+        self.bottom_screen_lbl.setMinimumHeight(26)
+        self.bottom_screen_lbl.setStyleSheet(self._bottom_style("none"))
+        sbox.addWidget(self.bottom_screen_lbl)
+        self.bottom_screen_sub_lbl = QLabel("")
+        self.bottom_screen_sub_lbl.setAlignment(Qt.AlignCenter)
+        self.bottom_screen_sub_lbl.setStyleSheet(
+            "color:#9FB6C9; font-family:'Consolas'; font-size:9px; "
+            "background:transparent;")
+        sbox.addWidget(self.bottom_screen_sub_lbl)
+        screen.setLayout(sbox)
+        btv.addWidget(screen)
+
+    def _bottom_style(self, kind):
+        bg = {"on": NORMAL_BG, "off": WARN_BG, "none": NEUTRAL_BG}
+        return (f"color:#FFFFFF; background:{bg.get(kind, NEUTRAL_BG)}; "
+                "font-family:'Segoe UI'; font-size:12px; font-weight:bold; "
+                "border-radius:6px; padding:4px;")
+
+    def update_bottom_screen_display(self):
+        """Live ON BOTTOM / OFF BOTTOM screen: derived from the single bit
+        depth. ON BOTTOM when the live bit position equals the deepest depth
+        reached (hole depth); OFF BOTTOM when the bit is shallower (tripping,
+        string above bottom). Uses the values recorded by bit_position_ft this
+        tick — never re-reads the property (which would re-advance the bit
+        state machine)."""
+        mw = self.mw
+        hd_ft = mw.hole_depth_ft
+        if hd_ft is None:
+            self.bottom_screen_lbl.setText("--")
+            self.bottom_screen_lbl.setStyleSheet(self._bottom_style("none"))
+            self.bottom_screen_sub_lbl.setText("set pipe in hole")
+            return
+        current_bit = mw.hole_last_bit_ft
+        if current_bit is None:
+            self.bottom_screen_lbl.setText("--")
+            self.bottom_screen_lbl.setStyleSheet(self._bottom_style("none"))
+            self.bottom_screen_sub_lbl.setText("no bit depth yet")
+            return
+        cb = float(current_bit)
+        hd = float(hd_ft)
+        if cb >= hd - 1e-9:
+            self.bottom_screen_lbl.setText("ON BOTTOM")
+            self.bottom_screen_lbl.setStyleSheet(self._bottom_style("on"))
+            self.bottom_screen_sub_lbl.setText(
+                f"Bit {cb:.1f} ft = Hole Depth {hd:.1f} ft")
+        else:
+            self.bottom_screen_lbl.setText("OFF BOTTOM")
+            self.bottom_screen_lbl.setStyleSheet(self._bottom_style("off"))
+            self.bottom_screen_sub_lbl.setText(
+                f"Bit {cb:.1f} ft < Hole Depth {hd:.1f} ft")
+
+    def update_block_position_display(self):
+        """Single source of truth for the Block Position readout. Reads the
+        internal feet value, converts to meters ONLY for display when the
+        selected unit is M, and updates the label + toggle button + trend."""
+        unit = self._position_unit if self._position_unit in ("FT", "M") else "FT"
+        feet = float(self.mw.block_position_ft or 0.0)
+        if unit == "M":
+            value = feet * 0.3048
+            label = f"{value:.2f} M"
+        else:
+            label = f"{feet:.2f} FT"
+        self.pos_value_lbl.setText(label)
+        # The button shows the unit you switch TO (promt1.txt: button = target).
+        self.unit_toggle_btn.setText("M" if unit == "FT" else "FT")
+        self.unit_toggle_btn.setStyleSheet(
+            self._unit_toggle_style(active=(unit == "FT")))
+        # The trend chart respects the same display unit (feet stay internal;
+        # the chart converts only its drawn values/labels).
+        self.graph.set_unit(unit)
+
+    def update_hookload_display(self):
+        """Update the three HOOKLOAD readouts (Low Point / Current / High
+        Point). Single source: the Analog Monitor's live channel-0 value
+        (mw.hookload_klb). Low / High Point are the ENGINEERING VALUES of the
+        Hookload two-point calibration (SENSOR_CONFIG[0] cal_val_lo /
+        cal_val_hi — the "Engineering Value (klb)" fields entered on the
+        calibrate tab for the LOW / HIGH CALIBRATION POINT)."""
+        cfg = SENSOR_CONFIG[0]
+        lo_val = cfg.get("cal_val_lo")
+        hi_val = cfg.get("cal_val_hi")
+        if lo_val is not None:
+            self.hook_low_lbl.setText(f"{float(lo_val):.2f}")
+        else:
+            self.hook_low_lbl.setText("--")
+        if hi_val is not None:
+            self.hook_high_lbl.setText(f"{float(hi_val):.2f}")
+        else:
+            self.hook_high_lbl.setText("--")
+        hk = self.mw.hookload_klb
+        if hk is None:
+            self.hook_current_lbl.setText("--")
+        else:
+            self.hook_current_lbl.setText(f"{float(hk):.2f}")
+        v = self.mw.analog_voltages[0]
+        if v is None:
+            self.hook_voltage_lbl.setText("--")
+        else:
+            self.hook_voltage_lbl.setText(f"{float(v):.3f}")
+
+    def update_string_length_display(self):
+        """Update the STRING LENGTH readout. Reads the authoritative tracked
+        string_length_ft (promt2.txt): String Length = Block Position + Bit
+        Position, constant during a pipe trip, following the block when the bit
+        holds without pipe load. Converts to METERS only for display."""
+        unit = self._position_unit if self._position_unit in ("FT", "M") else "FT"
+        sl_ft = self.mw.string_length_ft
+        if sl_ft is None:
+            self.string_length_lbl.setText("--")
+            self.string_length_lbl.setStyleSheet(self._string_figure_style())
+            self.sl_status_lbl.setText("● PIPE IN HOLE NOT SET")
+            self.sl_status_lbl.setStyleSheet(self._cal_status_style("no_calibration"))
+            return
+        if unit == "M":
+            value = float(sl_ft) * FT_TO_M
+            label = f"{value:.2f} M"
+        else:
+            label = f"{sl_ft:.2f} FT"
+        tripping = self.mw.bit_position_state == "TRACK"
+        self.string_length_lbl.setText(label)
+        self.string_length_lbl.setStyleSheet(self._string_figure_style(tripping=tripping))
+        pipe_in_hole = float(self.mw.pipe_in_hole_ft or 0.0)
+        if tripping:
+            # During pipe load the bit compensates block movement exactly, so
+            # String Length is legitimately flat; make that read as INTENTIONAL
+            # instead of a frozen/broken display (promt.txt §5/§6/§16).
+            self.sl_status_lbl.setText(
+                "■ STRING LENGTH CONSTANT - TRIPPING (PIPE LOAD)")
+            self.sl_status_lbl.setStyleSheet(self._cal_status_style("tripping"))
+        else:
+            self.sl_status_lbl.setText(
+                f"● PIPE IN HOLE {pipe_in_hole:.2f} FT · BIT FROZEN - SL FOLLOWS BLOCK")
+            self.sl_status_lbl.setStyleSheet(self._cal_status_style("valid"))
+        spin = self.pipe_in_hole_spin
+        if not spin.hasFocus() and abs(spin.value() - pipe_in_hole) > 0.000001:
+            spin.blockSignals(True)
+            spin.setValue(pipe_in_hole)
+            spin.blockSignals(False)
+
+    def update_slip_window_display(self):
+        """Update the Slip Window status + timer readouts (slip_window.txt).
+        Advances the confirmation machine off the live analog channel-0
+        hookload and shows the running confirmation TIME while CONFIRMING.
+        The LOAD cell shows the EFFECTIVE Slip Window Load = the configured
+        (input) load + the Hookload MINIMUM VALUE (channel-0 cal low point);
+        the TIME cell mirrors the configured span (single source:
+        mw.slip_window_effective_load_klb / mw.slip_window_time_sec)."""
+        mw = self.mw
+        mw._update_slip_window()
+        status = mw.slip_window_status
+        timer = mw.slip_window_timer_sec
+        self.slip_status_lbl.setText(status if status else "NOT ACTIVE")
+        self.slip_status_lbl.setStyleSheet(self._slip_status_style(status))
+        if mw.slip_window_enabled and mw.slip_window_time_sec is not None:
+            self.slip_timer_lbl.setText(f"{timer:.2f} / "
+                                        f"{float(mw.slip_window_time_sec):.2f} sec")
+        else:
+            self.slip_timer_lbl.setText("-- / -- sec")
+        load = mw.slip_window_effective_load_klb
+        if load is not None:
+            self.slip_load_disp_lbl.setText(f"{float(load):.2f}")
+        else:
+            self.slip_load_disp_lbl.setText("--")
+        tm = mw.slip_window_time_sec
+        if tm is not None:
+            self.slip_time_disp_lbl.setText(f"{float(tm):.2f}")
+        else:
+            self.slip_time_disp_lbl.setText("--")
+
     # ––––––––––––––––––––– per-tick refresh –––––––––––––––––────────
+    def reveal_calibration(self):
+        """Scroll the EXISTING calibration section into view. Used by the
+        Digital Sensor tab so its BLOCK POSITION option opens the calibration
+        dashboard itself rather than duplicating any part of it."""
+        page = getattr(self, "_readout_scroll", None)
+        group = getattr(self, "_cal_group", None)
+        if page is None or group is None:
+            return False
+        page.ensureWidgetVisible(group, 0, 12)
+        return True
+
     def apply_theme(self, name):
         self.refresh()
 
@@ -1682,17 +3355,24 @@ class BlockPositionTab(QWidget):
         # Always show the computed block position (ft). No "OUT OF RANGE" text:
         # the reported number is displayed regardless of calibration status.
         cal_status_raw = (mw.cal_status or "NO_CALIBRATION").upper()
-        pos = mw.block_position_ft
-        self.pos_value_lbl.setText(f"{pos:,.2f} ft")
-        self.velocity_lbl.setText(f"{mw.velocity_ft_min:,.2f}" if mw.cal_status else "--")
-        self.counter_lbl.setText(f"{mw.current_ticks:,}")
-        self.layer_lbl.setText(str(mw.current_layer or 1))
+        self.update_block_position_display()
+        # Advance the bit position machine BEFORE the string length readout:
+        # String Length = Block + Bit must reflect the committed bit depth of
+        # this tick (promt.txt §1/§16), so the bit screen updates first.
+        self.update_bit_screen_display()
+        self.update_hole_depth_display()
+        self.update_bottom_screen_display()
+        self.update_hookload_display()
+        self.update_string_length_display()
+        self.update_slip_window_display()
+        self.velocity_lbl.setText(f"{mw.velocity_ft_min:.2f}" if mw.cal_status else "--")
+        self.counter_lbl.setText(f"{mw.current_ticks:}")
 
         # Calibration status -------------------------------------------------
         cal_status = cal_status_raw
         if cal_status == "OUT_OF_RANGE":
-            self.cal_status_lbl.setText(f"{pos:,.2f} ft")
-            self.cal_status_lbl.setStyleSheet(self._cal_status_style("valid"))
+            self.cal_status_lbl.setText("OUT OF RANGE")
+            self.cal_status_lbl.setStyleSheet(self._cal_status_style("out_of_range"))
         elif cal_status == "VALID":
             self.cal_status_lbl.setText("● VALID")
             self.cal_status_lbl.setStyleSheet(self._cal_status_style("valid"))
@@ -1700,20 +3380,17 @@ class BlockPositionTab(QWidget):
             self.cal_status_lbl.setText("● NO CALIBRATION")
             self.cal_status_lbl.setStyleSheet(self._cal_status_style("no_calibration"))
 
-        # Direction (3-state: DOWN / ON BOTTOM / UP, plus STOPPED) -----------
-        direction = (mw.direction or "STOPPED").upper()
-        if mw.on_bottom and direction == "STOPPED":
-            self.dir_lbl.setText("▼ ON BOTTOM")
-            self.dir_lbl.setStyleSheet(self._dir_style("on_bottom"))
-        elif direction == "UP":
+        # Direction (2-state: UP / DOWN ONLY). promt.txt requires the dashboard
+        # to show only UP or DOWN and NEVER NONE/IDLE/STOPPED. `mw.direction` is
+        # derived from the live tick delta (kept at the last valid direction
+        # when the encoder stops); ON BOTTOM is tracked separately below.
+        direction = (mw.direction or "DOWN").upper()
+        if direction == "UP":
             self.dir_lbl.setText("▲ UP")
             self.dir_lbl.setStyleSheet(self._dir_style("up"))
-        elif direction == "DOWN":
+        else:
             self.dir_lbl.setText("▼ DOWN")
             self.dir_lbl.setStyleSheet(self._dir_style("down"))
-        else:
-            self.dir_lbl.setText("● STOPPED")
-            self.dir_lbl.setStyleSheet(self._dir_style("stopped"))
 
         # Calibration table rows ---------------------------------------------
         # The table IS the calibration input: ENCODER COUNTS / POSITION (FT) are
@@ -1764,8 +3441,8 @@ class BlockPositionTab(QWidget):
                 _cpf = (_c_hi - _c_lo) / (_f_hi - _f_lo)
             else:
                 _cpf = 0.0
-            cpf_lbl.setText(f"{_cpf:,.2f}" if _cpf > 0.0 else "—")
-            layer_lbl.setText(f"Level {layer_pk}")
+            cpf_lbl.setText(f"{_cpf:.2f}" if _cpf > 0.0 else "—")
+            layer_lbl.setText(f"Wrap {layer_pk}")
             if (i + 1) == cur_layer:
                 layer_lbl.setStyleSheet("background:transparent; color:#1E7A3E; "
                                         "font-family:'Segoe UI'; font-size:12px; font-weight:bold;")
@@ -1810,12 +3487,16 @@ class BlockPositionTab(QWidget):
             f"Protocol: {mw.encoder_protocol_version or '--'}  EEPROM: {mw.encoder_eeprom_status or '--'}  "
             f"SEQ: {mw.encoder_sequence}\n"
             f"Uptime: {mw.encoder_uptime_s}s  Boot: {mw.encoder_boot_reason or '--'}  "
-            f"WITS: {mw.device.get('witsCorrectionFt', 0.0):,.2f} ft  "
+            f"WITS: {mw.device.get('witsCorrectionFt', 0.0):.2f} ft  "
             f"Config: {conf_txt}")
 
         # Graph + current point ------------------------------------------------
-        self.graph_cur_lbl.setText(f"{pos:,.2f} ft")
+        ft = float(mw.block_position_ft or 0.0)
+        cunit = self._position_unit if self._position_unit in ("FT", "M") else "FT"
+        cdisp = ft * FT_TO_M if cunit == "M" else ft
+        self.graph_cur_lbl.setText(f"{cdisp:.2f} {cunit}")
         self.graph.update()
+        self._refresh_trend_status()
 
         # Command phase line -----------------------------------------------------
         self._refresh_status_line()
@@ -1834,10 +3515,10 @@ class BlockPositionTab(QWidget):
             # be issued again (duplicate-reset prevention only while in-flight).
             self.reset_btn.setEnabled(True)
 
-        self.reset_feet_btn.setText("RESET FEET")
+        self.reset_feet_btn.setText("RESET POSITION")
         phase, _ = self._op_phase("reset_feet")
         if phase == "pending":
-            self.reset_feet_btn.setText("RESET FEET PENDING…")
+            self.reset_feet_btn.setText("RESET POSITION PENDING…")
             self.reset_feet_btn.setEnabled(False)
         else:
             # Re-enable after success / failure / timeout (duplicate prevention

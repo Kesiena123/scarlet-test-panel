@@ -60,6 +60,7 @@ _LIGHT = {
     "TEXT_DARK":         _c(0x1A, 0x14, 0x0A),
     "TEXT_MID":          _c(0x6B, 0x5E, 0x4E),
     "TEXT_LITE":         _c(0xA0, 0x92, 0x80),
+    "TEXT_ON_DARK":      _c(0xFF, 0xF5, 0xF0),   # light text on dark surfaces
     "BORDER":            _c(0xC8, 0xBD, 0xAD),
     "BORDER_HOVER":      _c(0xB5, 0xA9, 0x99),
     "GRID_CLR":          _c(0xD8, 0xCF, 0xC0),
@@ -109,6 +110,7 @@ _DARK = {
     "TEXT_DARK":     _c(0xF2, 0xF0, 0xEA),
     "TEXT_MID":      _c(0xC7, 0xC2, 0xB8),
     "TEXT_LITE":     _c(0x9A, 0x96, 0x8C),
+    "TEXT_ON_DARK":  _c(0xFF, 0xFF, 0xFF),
     "BORDER":        _c(0x45, 0x4C, 0x59),
     "BORDER_HOVER":  _c(0x5A, 0x63, 0x73),
     "GRID_CLR":      _c(0x3A, 0x41, 0x4E),
@@ -141,7 +143,61 @@ _DARK = {
     "GRAPH_GRID":   _c(0x4A, 0x52, 0x60),
 }
 
-_STYLES = {"light": _LIGHT, "dark": _DARK}
+# ─────────────────────────────────────────────────────────────
+# Red palette (professional industrial Oil & Gas control HMI)
+# A dark-red structural chrome combined with white content cards for
+# maximum readability. Hierarchy:
+#   BG_MAIN  dark red        — window / structure / major areas
+#   BG_INNER deep red        — panels, section bars, status & button bg
+#   ACCENT   industrial red  — primary action buttons & emphasis
+#   BORDER   light red       — outlines, separators, highlights
+#   BG_CARD  white/light     — content, inputs, tables, data entry
+# Text is light on the dark-red surfaces and dark on white surfaces.
+# ─────────────────────────────────────────────────────────────
+_RED = {
+    "BG_MAIN":       _c(0x7B, 0x1A, 0x1A),   # dark industrial red
+    "BG_CARD":       _c(0xFF, 0xFD, 0xF7),   # white content / inputs / tables
+    "BG_INNER":      _c(0x8E, 0x23, 0x23),   # deep industrial red
+    "ACCENT":        _c(0xC0, 0x39, 0x2B),   # industrial red
+    "ACCENT_HOVER":  _c(0xA9, 0x30, 0x26),
+    "ACCENT_PRESSED":_c(0x8E, 0x24, 0x1C),
+    "TEXT_DARK":     _c(0x1A, 0x14, 0x0A),   # on-white text
+    "TEXT_MID":      _c(0x5A, 0x48, 0x3C),   # muted on-white text
+    "TEXT_LITE":     _c(0xA0, 0x96, 0x8C),   # faint on-white text
+    "TEXT_ON_DARK":  _c(0xFF, 0xF5, 0xF0),   # light text on dark red
+    "BORDER":        _c(0xD9, 0x53, 0x4F),   # light red accent
+    "BORDER_HOVER":  _c(0xE0, 0x66, 0x63),
+    "GRID_CLR":      _c(0xC8, 0xB0, 0xAC),
+    "CAL_MIN_CLR":   _c(0x2A, 0x7F, 0xBD),   # blue marker
+    "CAL_MAX_CLR":   _c(0x2E, 0x8B, 0x4E),   # green marker
+    "CAL_BAND_CLR":  _c(0xD4, 0x7B, 0x0F),   # amber band
+    "OK":            _c(0x3E, 0xA0, 0x5C),   # normal / ok
+    "WARN":          _c(0xD9, 0x8A, 0x1C),   # warning
+    "FAULT":         _c(0xC0, 0x39, 0x2B),   # fault
+    "STALE":         _c(0x9A, 0x66, 0x14),   # stale / no data
+    "RECOVER":       _c(0xD9, 0x8A, 0x1C),   # recovered (amber + text)
+    "INFO_LINK":     _c(0x2A, 0x7F, 0xC0),   # hyperlink / info
+    "TEXT_ON_STATUS":_c(0xFF, 0xFF, 0xFF),   # text on status chips
+    "ON_OK":         _c(0xFF, 0xFF, 0xFF),
+    "ON_DANGER":     _c(0xFF, 0xFF, 0xFF),
+    "ON_PENDING":    _c(0xFF, 0xFF, 0xFF),
+    "SENSOR_COLORS": [
+        _c(0xC0, 0x39, 0x2B),
+        _c(0x2A, 0x7F, 0xBD),
+        _c(0x2E, 0x8B, 0x4E),
+        _c(0xD9, 0x8A, 0x1C),
+        _c(0x7B, 0x3F, 0xA0),
+        _c(0x2F, 0x8B, 0x94),
+    ],
+    "GAUGE_BG_TOP": _c(0x9E, 0x30, 0x28),
+    "GAUGE_BG_MID": _c(0x86, 0x26, 0x22),
+    "GAUGE_BG_BTM": _c(0x6E, 0x1C, 0x1C),
+    "GAUGE_RIM":    _c(0xD9, 0x53, 0x4F),
+    "GRAPH_BG":     _c(0xFF, 0xFF, 0xFB),
+    "GRAPH_GRID":   _c(0xBE, 0xA6, 0xA2),
+}
+
+_STYLES = {"light": _LIGHT, "dark": _DARK, "red": _RED}
 
 
 class Theme:
@@ -211,6 +267,7 @@ ACCENT    = None
 TEXT_DARK = None
 TEXT_MID  = None
 TEXT_LITE = None
+TEXT_ON_DARK = None
 BORDER    = None
 GRID_CLR  = None
 CAL_MIN_CLR  = None
@@ -227,6 +284,7 @@ def refresh_shortcuts():
     """
     global BG_MAIN, BG_CARD, BG_INNER, ACCENT, TEXT_DARK, TEXT_MID
     global TEXT_LITE, BORDER, GRID_CLR, CAL_MIN_CLR, CAL_MAX_CLR, CAL_BAND_CLR
+    global TEXT_ON_DARK
     t = current()
     BG_MAIN   = t.color("BG_MAIN")
     BG_CARD   = t.color("BG_CARD")
@@ -235,6 +293,7 @@ def refresh_shortcuts():
     TEXT_DARK = t.color("TEXT_DARK")
     TEXT_MID  = t.color("TEXT_MID")
     TEXT_LITE = t.color("TEXT_LITE")
+    TEXT_ON_DARK = t.color("TEXT_ON_DARK")
     BORDER    = t.color("BORDER")
     GRID_CLR  = t.color("GRID_CLR")
     CAL_MIN_CLR  = t.color("CAL_MIN_CLR")

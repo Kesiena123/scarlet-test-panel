@@ -3,9 +3,8 @@ import serial.tools.list_ports
 from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QLabel, QComboBox,
                              QPushButton, QMessageBox)
 from PyQt5.QtCore import Qt
-from ..config import BG_INNER, BG_CARD, BORDER, ACCENT, TEXT_MID, TEXT_LITE
-from ..services.security import (ROLE_OPERATOR, ROLE_SUPERVISOR, ROLE_ENGINEER,
-                                 _ROLE_ORDER)
+from ..config import BG_INNER, BG_CARD, BORDER, ACCENT, TEXT_MID, TEXT_LITE, TEXT_ON_DARK
+from ..services.security import ROLE_OPERATOR, ROLE_ENGINEER
 from ..services.settings import load as load_settings
 
 BAUD_OPTIONS = ["9600", "19200", "38400", "57600", "115200"]
@@ -62,7 +61,7 @@ class StatusBar(QWidget):
             else:
                 self.port_cb.insertItem(0, _saved_port)
                 self.port_cb.setCurrentText(_saved_port)
-        _saved_baud = str(_saved.get("baud", "9600"))
+        _saved_baud = str(_saved.get("baud", "115200"))
         if _saved_baud in BAUD_OPTIONS:
             self.baud_cb.setCurrentText(_saved_baud)
 
@@ -83,12 +82,17 @@ class StatusBar(QWidget):
         self.demo_btn.setCursor(Qt.PointingHandCursor)
         self.demo_btn.setStyleSheet(f"QPushButton {{ {B} color:#7A5C10; font-weight:bold; }} QPushButton:hover {{ background:{BORDER.name()}; }}")
 
-        # Role toggle (simple switch — see security notes; not a substitute for auth)
-        self.role_btn = QPushButton(f"ROLE: {ROLE_OPERATOR.upper()}")
-        self.role_btn.setFixedWidth(160)
-        self.role_btn.setStyleSheet(self._role_style())
+        # Role indicator / toggle — two visible roles: OPERATOR (view-only,
+        # default) and ENGINEER (full access). The Engineer state is temporary:
+        # it never persists and the supervisor permission gates still apply (the
+        # ENGINEER rank is the highest, so every existing at_least/supervisor
+        # check passes while it is active).
+        self.role_btn = QPushButton()
+        self.role_btn.setFixedWidth(180)
+        self.role_btn.setCursor(Qt.PointingHandCursor)
         self.role_btn.clicked.connect(self._toggle_role)
-        self.role_btn.setText(f"ROLE: {roles.role().upper()}")
+        self._refresh_role_ui(roles.role())
+        roles.subscribe(self._refresh_role_ui)
 
         export_csv = QPushButton("Export CSV")
         export_csv.setFixedWidth(84)
@@ -104,7 +108,7 @@ class StatusBar(QWidget):
 
         def lbl2(t):
             l = QLabel(t)
-            l.setStyleSheet(f"color:{TEXT_MID.name()}; font-family:'Segoe UI'; font-size:11px;")
+            l.setStyleSheet(f"color:{TEXT_ON_DARK.name()}; font-family:'Segoe UI'; font-size:11px;")
             return l
 
         for w in [lbl2("Port:"), self.port_cb, lbl2("Baud:"), self.baud_cb,
@@ -185,41 +189,46 @@ class StatusBar(QWidget):
         if (index >= 0 and "Refresh" in self.port_cb.itemText(index)):
             self.refresh_ports()
 
-    def _role_style(self):
-        role = self.roles.role()
-        if role == ROLE_ENGINEER:
-            return ("QPushButton { background:#2C6E49; color:white; border:none; "
-                    "border-radius:4px; font-family:'Segoe UI'; font-size:11px; "
-                    "font-weight:bold; padding:4px; }")
-        if self.roles.is_supervisor():
-            return ("QPushButton { background:#1A5C94; color:white; border:none; "
-                    "border-radius:4px; font-family:'Segoe UI'; font-size:11px; "
-                    "font-weight:bold; padding:4px; }")
-        return ("QPushButton { background:#6B5E4E; color:white; border:none; "
+    def role_status_text(self, role=None):
+        """ROLE / STATUS text. Every role has full access, so the status is
+        always FULL ACCESS and the role is a label only."""
+        role = role or self.roles.role()
+        return f"ROLE: {role.upper()}  STATUS: FULL ACCESS"
+
+    def _full_access_style(self):
+        return ("QPushButton { background:#2C6E49; color:white; border:none; "
                 "border-radius:4px; font-family:'Segoe UI'; font-size:11px; "
                 "font-weight:bold; padding:4px; }")
 
+    def _refresh_role_ui(self, role=None):
+        """Render the role indicator for the current role. Subscribed to
+        RoleManager changes so it also fires when auto-return drops the role
+        back to OPERATOR after a modification."""
+        role = role or self.roles.role()
+        self.role_btn.setText(self.role_status_text(role))
+        self.role_btn.setStyleSheet(self._full_access_style())
+
+    def _role_style(self):
+        return self._full_access_style()
+
     def _toggle_role(self):
+        """Cycle between the two visible role labels (OPERATOR <-> ENGINEER).
+        This is a LABEL only - it does not grant or restrict anything, since
+        every role already has full access. No PIN (see security notes)."""
         cur = self.roles.role()
-        idx = _ROLE_ORDER.index(cur) if cur in _ROLE_ORDER else 0
-        new_role = _ROLE_ORDER[(idx + 1) % len(_ROLE_ORDER)]
+        new_role = ROLE_OPERATOR if cur == ROLE_ENGINEER else ROLE_ENGINEER
         old = self.roles.role()
         self.roles.set_role(new_role)
-        self.role_btn.setText(f"ROLE: {new_role.upper()}")
-        self.role_btn.setStyleSheet(self._role_style())
+        self._refresh_role_ui(new_role)
         from ..services.settings import save as save_settings
-        save_settings({"role": new_role})
+        save_settings({"role": ROLE_OPERATOR})  # label never persists
         self.audit.record("ROLE_CHANGE", f"role changed {old} -> {new_role}", new_role)
-        cap = {
-            ROLE_OPERATOR: "Operator: view-only dashboards, alarms, trends, events.",
-            ROLE_SUPERVISOR: "Supervisor: Operator access + reset/tare, calibrate, "
-                             "configure layers/params, export, diagnostics.",
-            ROLE_ENGINEER: "Engineer: Supervisor access + raw encoder information, "
-                           "advanced measurement parameters, communication & "
-                           "firmware diagnostics.",
-        }[new_role]
-        QMessageBox.information(self.window(), "Role changed",
-                                f"Active role: {new_role.upper()}\n{cap}")
+        QMessageBox.information(
+            self.window(), "Role changed",
+            f"{self.role_status_text(new_role)}\n"
+            "All roles have full access: view, calibrate, reset/tare, "
+            "configure parameters, export and diagnostics. The role is a "
+            "display label only.")
 
     # -- state setters ------------------------------------------------------
     def set_connected(self, connected, port=""):

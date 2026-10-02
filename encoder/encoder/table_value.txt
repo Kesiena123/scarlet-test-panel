@@ -1,0 +1,350 @@
+Responsive Value Table for the Block Position Tab
+
+Task: Redesign only the value-display area of the existing Block Position tab so that all existing screen boxes that display Block Position, Bit Position, Hookload, String Length, Slip Window, and other relevant live values are organized into a clean, professional, responsive table/grid layout.
+
+IMPORTANT: Do not remove or break any existing functionality, calculations, Arduino communication, encoder logic, Hookload logic, calibration, Slip Window logic, Demo/Live mode, RBAC, or existing controls.
+
+1. ORGANIZE ALL VALUE BOXES INTO A STRUCTURED TABLE
+
+Replace the current scattered/uneven arrangement of value boxes with a consistent responsive table/grid.
+
+Use a professional industrial-monitoring layout with:
+
+Consistent row and column alignment
+Equal-width value cells where appropriate
+Consistent spacing
+Consistent box heights
+Clear labels
+Large, readable live values
+Units displayed consistently
+Proper visual hierarchy
+No unnecessary empty spaces
+No overlapping widgets
+No horizontal scrolling
+No unnecessary vertical scrolling on normal desktop/laptop resolutions
+
+The layout should look like a professional industrial control/monitoring interface, not a collection of unrelated cards.
+
+2. RECOMMENDED TABLE STRUCTURE
+
+Organize the information into logical sections.
+
+POSITION INFORMATION
+BLOCK POSITION	BIT POSITION	STRING LENGTH
+Live value	Live value	Calculated value
+ft / m	ft / m	ft / m
+HOOKLOAD INFORMATION
+HOOKLOAD	PIPE WEIGHT	MINIMUM VALUE	CURRENT VALUE
+Live value	Live value	Calibrated value	Calibrated value
+klb	klb	klb	klb
+SLIP WINDOW INFORMATION
+SLIP WINDOW LOAD	SLIP WINDOW TIME	TIMER	STATUS
+Configured value	Configured value	Live countdown/progress	Current state
+klb	sec	sec	Confirming/Confirmed/etc.
+
+The exact values and fields should be taken from the existing application, so no existing important value is accidentally removed.
+
+3. VALUE BOX DESIGN
+
+Each table cell containing a live value should have a consistent structure:
+
+┌─────────────────────────────┐
+│       BLOCK POSITION        │
+│                             │
+│         125.50              │
+│             ft              │
+└─────────────────────────────┘
+
+Use:
+
+Label → Large Value → Unit
+
+Do not make the labels excessively large.
+
+The numerical value should be the visual focus because this is a real-time monitoring screen.
+
+4. RESPONSIVE BEHAVIOR
+
+The table must automatically adapt to different screen sizes.
+
+Large desktop
+
+Use a wider multi-column arrangement.
+
+Example:
+
+┌────────────┬────────────┬────────────┐
+│   BLOCK    │    BIT     │   STRING   │
+├────────────┼────────────┼────────────┤
+│  HOOKLOAD  │ PIPE WEIGHT│  MINIMUM   │
+├────────────┼────────────┼────────────┤
+│  CURRENT   │ SLIP LOAD  │ SLIP TIME  │
+└────────────┴────────────┴────────────┘
+Laptop / smaller desktop
+
+Automatically reduce the number of columns while maintaining readability.
+
+Smaller window
+
+Allow the grid to reorganize into fewer columns rather than compressing the value boxes until they become unreadable.
+
+For example:
+
+┌────────────┬────────────┐
+│   BLOCK    │    BIT     │
+├────────────┼────────────┤
+│   STRING   │  HOOKLOAD  │
+├────────────┼────────────┤
+│ PIPE WEIGHT│  MINIMUM   │
+├────────────┼────────────┤
+│  CURRENT   │ SLIP LOAD  │
+└────────────┴────────────┘
+
+The interface should remain usable without horizontal scrolling.
+
+5. PRIORITIZE IMPORTANT LIVE VALUES
+
+The most important real-time values should have stronger visual prominence.
+
+Priority should generally be:
+
+Block Position
+Bit Position
+String Length
+Hookload
+Pipe Weight
+Minimum Value
+Current Value
+Slip Window information
+
+Do not remove lower-priority information; simply give the primary operational values more visual emphasis.
+
+6. LIVE VALUE UPDATES
+
+The table must update values in real time using the application's existing data/calculation sources.
+
+Do not create duplicate calculations.
+
+For example:
+
+Block Position → use existing Block Position calculation.
+Bit Position → use the existing Bit Position calculation.
+String Length → use the existing String Length calculation.
+Hookload → use existing Hookload calculation.
+Pipe Weight → use existing Pipe Weight calculation.
+Minimum Value → use existing calibrated value.
+Current Value → use existing calibrated value.
+Slip Window Load → use existing Slip Window configuration.
+Slip Window Time → use existing configuration.
+Slip Window Timer → use the existing timer/state logic.
+
+The table is only a presentation layer. It must not create a second calculation engine.
+
+7. CONSISTENT UNITS
+
+Display units directly beneath or beside the numerical value.
+
+Examples:
+
+125.50
+ft
+25.40
+klb
+5.00
+sec
+
+Respect the application's existing feet/meters unit toggle.
+
+When the user changes the unit:
+
+Block Position updates.
+Bit Position updates.
+String Length updates.
+Any other distance-related values update consistently.
+
+Do not change the underlying stored calibration values unnecessarily.
+
+8. STATUS DISPLAY
+
+The Slip Window status should be visually clear.
+
+Possible states:
+
+NOT ACTIVE
+CONFIRMING
+CONFIRMED
+
+During confirmation, display the timer clearly:
+
+SLIP TIMER
+
+3.42 / 5.00 sec
+
+or:
+
+3.42 sec
+
+with an appropriate progress indicator if it fits the existing design.
+
+The status must come from the existing Slip Window state machine.
+
+9. TABLE ALIGNMENT
+
+Every row and column should align perfectly.
+
+Maintain:
+
+Equal margins
+Equal internal padding
+Equal cell spacing
+Consistent borders
+Consistent corner radius
+Consistent typography
+Consistent value alignment
+
+Numerical values should preferably be centered or consistently right-aligned across the table.
+
+Do not allow one value box to appear significantly larger or smaller than another without a clear design reason.
+
+10. RESPONSIVE HEIGHT MANAGEMENT
+
+The Block Position tab should make maximum use of the available screen height.
+
+Avoid a design where:
+
+Value boxes
+↓
+large empty space
+↓
+more value boxes
+↓
+unnecessary scrolling
+
+Instead, dynamically distribute the table within the available content area.
+
+The primary monitoring values should ideally be visible simultaneously on a normal desktop/laptop screen.
+
+11. PROFESSIONAL INDUSTRIAL APPEARANCE
+
+Maintain the existing application's industrial visual identity.
+
+The redesign should look:
+
+Professional
+Clean
+Technical
+Organized
+High readability
+Suitable for an oil-rig monitoring/control environment
+Suitable for continuous operator monitoring
+
+Do not introduce unnecessary decorative graphics.
+
+Do not make the interface look like a generic consumer dashboard.
+
+12. OPERATOR / ENGINEER BEHAVIOR
+
+The table must respect the existing RBAC.
+
+Operator
+
+Values are:
+
+VIEW ONLY
+
+The Operator must not be able to modify calibration/settings simply by clicking a value box.
+
+Engineer
+
+Engineer retains the existing permissions for:
+
+Calibration
+Slip Window settings
+Hookload settings
+Other existing configurable parameters
+
+Do not change the existing RBAC architecture.
+
+13. DO NOT CHANGE EXISTING CALCULATIONS
+
+This redesign is primarily a UI/layout task.
+
+Do not modify the formulas for:
+
+Block Position
+Bit Position
+String Length
+Hookload
+Pipe Weight
+Minimum Value
+Current Value
+Slip Window
+
+unless absolutely required to connect an existing value to the new display.
+
+The existing calculation engine must remain the single source of truth.
+
+14. IMPORTANT — DO NOT BREAK EXISTING CODE
+
+Before making changes:
+
+Inspect the existing Block Position tab.
+Identify every existing value-display box.
+Identify the data source for each value.
+Identify which values are live and which are calculated/configured.
+Preserve all existing signals and update mechanisms.
+Reorganize the widgets into the new responsive table/grid.
+Remove only redundant visual containers if they are being replaced by the new table.
+Do not delete the underlying functionality.
+DO NOT BREAK:
+Arduino communication
+Encoder calculation
+Block Position
+Bit Position
+String Length
+Hookload
+Pipe Weight
+Minimum Value
+Current Value
+Slip Window
+Calibration
+Demo Mode
+Live Mode
+Feet/Metres toggle
+RBAC
+Operator mode
+Engineer mode
+Existing buttons
+Existing signals
+Existing data storage
+15. FINAL UI REQUIREMENT
+
+The final Block Position tab should feel like one unified professional monitoring panel rather than many independent boxes.
+
+Use a structure similar to:
+
+┌─────────────────────────────────────────────────────────────┐
+│                    BLOCK POSITION                           │
+├──────────────────────┬──────────────────────┬───────────────┤
+│    BLOCK POSITION    │     BIT POSITION     │ STRING LENGTH │
+│                      │                      │               │
+│      125.50          │       250.00         │    375.50     │
+│         ft           │          ft          │       ft      │
+├──────────────────────┼──────────────────────┼───────────────┤
+│       HOOKLOAD       │     PIPE WEIGHT      │ MINIMUM VALUE │
+│                      │                      │               │
+│       25.40          │        15.40         │     10.00     │
+│        klb           │         klb          │      klb      │
+├──────────────────────┼──────────────────────┼───────────────┤
+│   CURRENT VALUE      │  SLIP WINDOW LOAD    │ SLIP TIME     │
+│                      │                      │               │
+│       25.00          │        20.00         │      5.00     │
+│        klb           │         klb          │      sec      │
+├──────────────────────┴──────────────────────┼───────────────┤
+│             SLIP WINDOW TIMER               │    STATUS     │
+│                 3.25 / 5 sec                │  CONFIRMING   │
+└────────────────────────────────────────────┴───────────────┘
+
+The exact number of columns may automatically change according to the available screen width.
+
+Final requirement: Make the Block Position tab responsive, balanced, compact, readable, and professionally organized, while preserving every existing calculation and functionality. The new table must be a presentation/layout improvement only, with the existing application logic remaining the single source of truth.

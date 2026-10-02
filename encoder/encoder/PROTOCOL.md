@@ -1,6 +1,6 @@
 # Device ↔ Dashboard Serial Protocol (Reference)
 
-Firmware: `encoder` (Arduino Mega 2560) · Protocol version **4.1**
+Firmware: `encoder` (Arduino Mega 2560) · Protocol version **4.2**
 
 This document is the single source of truth for communicating with the
 **Block Position Monitor** firmware. A dashboard (or any integrator) can
@@ -12,7 +12,7 @@ firmware source. The reference implementation that consumes this protocol is
 
 ## 1. Transport
 
-- **Physical link:** UART over USB. **Baud:** `9600`, 8N1.
+- **Physical link:** UART over USB. **Baud:** `115200`, 8N1.
 - **Framing:** each JSON object is a **single line** terminated by `\n`
   (a `\r` may also appear and is treated as a terminator).
 - **Line limits:** inbound lines up to `SERIAL_LINE_MAX` (220 bytes) are
@@ -216,6 +216,55 @@ never a cached value.
 Applies whichever action is currently staged. If nothing is staged →
 `ack state:"error"`, `ec:7` (`CMD_ERR_NO_PENDING`).
 
+### 3.8 `sensor_set_param` — **two-stage** (16-channel analog bank)
+
+```
+{"cmd":"sensor_set_param","sensor":3,"param":"value_high","value":75.0,"req_id":11}
+{"cmd":"confirm","req_id":11}
+```
+
+Updates **one** calibration/configuration parameter of analog **Sensor 1..15**
+(`sensor` must be `1..15`; Sensor 0 is the physical hookload chain and is
+owned by the hookload model — it is **never** writable through this command).
+`param` is one of:
+
+| `param`          | Meaning                                        | Range |
+|------------------|------------------------------------------------|-------|
+| `voltage_low`    | two-point low calibration volts               | 0..6 V |
+| `voltage_high`   | two-point high calibration volts              | 0..6 V |
+| `value_low`      | engineering value @ low point                 | ±1e6 |
+| `value_high`     | engineering value @ high point                | ±1e6 |
+| `min_eng`        | below this engineering value → LOW/FAULT      | ±1e6 |
+| `max_eng`        | above this engineering value → HIGH/FAULT     | ±1e6 |
+| `gain`           | voltage scale-correction (corrected = raw·gain + offset) | 0.5..1.5 |
+| `offset`         | voltage offset (V)                            | ±0.5 V |
+| `filter`         | EMA window (1 = no filtering)                 | 1..64 |
+
+Validation happens **before** staging: unknown `param` → `ec:3`; value outside
+the accepted range → `ec:4`. Confirm applies the change, **auto-persists the
+whole 16-channel bank block to EEPROM**, and returns `ack state:"done"`.
+Sensor 0 rejects with `ec:4` (`sensor` must be `1..15`).
+
+### 3.9 `sensor_reset` — **immediate**
+
+```
+{"cmd":"sensor_reset","sensor":4,"req_id":12}
+```
+
+Resets **one** channel's **live** fault/status state (`0..15`) — NO_DATA →
+re-acquired. Calibration is **never** modified. `done` ack.
+
+### 3.10 `sensor_factory_reset` — **immediate**
+
+```
+{"cmd":"sensor_factory_reset","req_id":13}
+```
+
+Restores **Sensor 1..15** to the dashboard-factory two-point calibration
+defaults and persists them. **Sensor 0 is untouched** (owned by hookload). A
+`log` event `"ANALOG: sensor bank returned to factory calibration by
+operator"` is emitted.
+
 ---
 
 ## 4. Message schemas (firmware → host)
@@ -250,7 +299,7 @@ All schemas below are the **authoritative** byte-for-byte format emitted by
   "currentTicks":4437,
   "blockPositionFt":31.58,
   "velocityFtMin":0.0,
-  "direction":"UP|DOWN|ON BOTTOM|STOPPED",
+  "direction":"UP|DOWN|NONE",
   "calStatus":"NO_CALIBRATION|VALID|OUT_OF_RANGE",
   "calInRange":1,
   "onBottom":false,
@@ -264,6 +313,42 @@ All schemas below are the **authoritative** byte-for-byte format emitted by
 }
 ```
 
+**Every 5th report** (≈ every 500 ms, `SENSOR_BROADCAST_PERIOD_MS`) the
+firmware additionally appends the **16-channel analog sensor bank** between the
+measurement summary and `uptime_s`:
+
+```
+"hookloadWindowMs":2500,
+"sensor1":2.61, "sensor2":0.75, ...  "sensor16":5.000,   // VOLTS, 3 d.p.
+"sensorStatus":"NNNNNNNNLLNHFNNH",
+"uptime_s":123,
+```
+
+- `"sensorN"` = the **corrected input voltage** (V) of Sensor N−1. `sensor1`
+  is Sensor 0 → the hookload chain's filtered A0 voltage. `sensor16` is a
+  fully independent key — `sensor1` and `sensor16` can never collide.
+- `"sensorStatus"` is a compact **16-char** string, `char[i]` = status of
+  Sensor `i` (index 0 == Sensor 0 == `sensor1`), using the vocabulary:
+
+  | char | meaning                        | char | meaning     |
+  |------|--------------------------------|------|-------------|
+  | `N`  | NORMAL                         | `F`  | FAULT       |
+  | `L`  | LOW (below `min_eng`)          | `D`  | DISCONNECTED|
+  | `H`  | HIGH (above `max_eng`)         | `C`  | CALIBRATION |
+  | `I`  | INVALID                        | `X`  | NO_DATA     |
+  | `U`  | UNUSED (channel disabled)      |      |             |
+
+- A channel disabled via `sensor_set_param … param "enabled"` is **never
+  sampled** by the firmware; its `sensorN` voltage key is emitted as `0.000`
+  and its status char is `U` (UNUSED) so the dashboard never mistakes a
+  floating unused input for a live reading.
+
+- Sensor 0's status char is derived from the hookload subsystem's own loop
+  diagnosis (`VALID`→`N`, `SENSOR_FAULT`→`F`, `OVER_RANGE`→`H`,
+  `NO_CALIBRATION`→`C`, else `I`).
+- Reports that do **not** carry the sensor block simply omit the two fields;
+  a host must treat a missing `sensorStatus` as "no data yet".
+
 ### 4.3 `ack` — the command reply
 
 ```
@@ -271,7 +356,7 @@ All schemas below are the **authoritative** byte-for-byte format emitted by
   "type":"ack",
   "action":"set_calibration_point|set_wits_correction|save_calibration|
             load_calibration|restore_defaults|clear_calibration_point|
-            set_encoder_polarity|confirm|...",
+            set_encoder_polarity|sensor_set_param|confirm|...",
   "state":"awaiting_confirm|done|rejected|error",
   "value":<echo>?,            // 4 d.p., present when the staged value is meaningful
   "ec":<code>?,               // 0 on awaiting_confirm; code on rejected/error
@@ -479,6 +564,15 @@ not exist anywhere in the firmware or dashboard.
 
 ## 9. Version history of the protocol
 
+- **4.2** — 16-channel analog sensor bank (Sensor 0..15). The periodic
+  `report` carries the live bank every 500 ms: self-describing voltage keys
+  `sensor1`..`sensor16` plus the compact position-indexed `sensorStatus` string
+  (index 0 == Sensor 0). New commands: `sensor_set_param` (two-stage,
+  one channel of Sensor 1..15; `sensor`+`param`+`value`, persisted to EEPROM),
+  `sensor_reset` (immediate, live-state only), `sensor_factory_reset`
+  (immediate, restores Sensor 1..15 defaults; Sensor 0 is hookload-owned and
+  untouched). Command dispatch now parses fields by targeted re-scan
+  (`req_id` stays bit-exact long).
 - **4.1** — Configurable encoder direction polarity, single-level delete, and
   calibration validation. New commands `set_encoder_polarity` (two-stage,
   `value` `+1`/`-1`, persisted, echoed as `encoderPolarity` in the summary) and

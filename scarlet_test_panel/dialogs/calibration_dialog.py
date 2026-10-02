@@ -27,7 +27,7 @@ class VoltageCalibrationDialog(QDialog):
         self.setWindowTitle(f"Calibrate — {cfg['name']}")
         self.setModal(True)
         self.setMinimumSize(850, 750)
-        self.setStyleSheet(f"background:{BG_MAIN.name()};")
+        self.setStyleSheet(f"background:{BG_CARD.name()};")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
         root = QVBoxLayout(self)
@@ -42,8 +42,8 @@ class VoltageCalibrationDialog(QDialog):
         self.name_edit = QLineEdit(cfg["name"])
         self.name_edit.setFixedWidth(180)
         self.name_edit.setStyleSheet(f"""
-            QLineEdit {{ background:{BG_INNER.name()}; color:{TEXT_DARK.name()};
-                border:1px solid {BORDER.name()}; border-radius:4px;
+            QLineEdit {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()};
+                border:1px solid {ACCENT.name()}; border-radius:4px;
                 font-family:'Georgia'; font-size:14px; font-weight:bold; padding:3px 8px; }}
             QLineEdit:focus {{ border:1px solid {ACCENT.name()}; }}
         """)
@@ -94,8 +94,8 @@ class VoltageCalibrationDialog(QDialog):
 
         S_SPIN = f"""
             QDoubleSpinBox {{
-                background:{BG_INNER.name()}; color:{TEXT_DARK.name()};
-                border:1px solid {BORDER.name()}; border-radius:4px;
+                background:{BG_CARD.name()}; color:{TEXT_DARK.name()};
+                border:1px solid {ACCENT.name()}; border-radius:4px;
                 font-family:'Georgia'; font-size:12px; padding:4px;
                 min-height: 30px;
             }}
@@ -228,7 +228,7 @@ class VoltageCalibrationDialog(QDialog):
         S_PRI = f"QPushButton {{ background:{ACCENT.name()}; color:white; border:none; border-radius:4px; font-family:'Georgia'; font-size:12px; font-weight:bold; padding:7px 20px; }} QPushButton:hover {{ background:#a03020; }} QPushButton:disabled {{ background:{BORDER.name()}; color:{TEXT_LITE.name()}; }}"
         S_SEC = f"QPushButton {{ background:{CAL_MAX_CLR.name()}; color:white; border:none; border-radius:4px; font-family:'Georgia'; font-size:12px; font-weight:bold; padding:7px 20px; }} QPushButton:hover {{ background:#155e30; }} QPushButton:disabled {{ background:{BORDER.name()}; color:{TEXT_LITE.name()}; }}"
         S_SUB = f"QPushButton {{ background:#2C6E49; color:white; border:none; border-radius:4px; font-family:'Georgia'; font-size:12px; font-weight:bold; padding:7px 22px; }} QPushButton:hover {{ background:#1e5035; }} QPushButton:disabled {{ background:{BORDER.name()}; color:{TEXT_LITE.name()}; }}"
-        S_CAN = f"QPushButton {{ background:{BG_INNER.name()}; color:{TEXT_MID.name()}; border:1px solid {BORDER.name()}; border-radius:4px; font-family:'Georgia'; font-size:12px; padding:7px 18px; }} QPushButton:hover {{ background:{BORDER.name()}; }}"
+        S_CAN = f"QPushButton {{ background:{BG_CARD.name()}; color:{TEXT_DARK.name()}; border:1px solid {BORDER.name()}; border-radius:4px; font-family:'Georgia'; font-size:12px; padding:7px 18px; }} QPushButton:hover {{ background:{BORDER.name()}; }}"
         self._s_pri = S_PRI
         self._s_sec = S_SEC
 

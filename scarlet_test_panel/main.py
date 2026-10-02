@@ -20,7 +20,7 @@
 #  anchor points (encoderCount, positionFt):
 #      position = P1 + (count - C1)/(C2 - C1) * (P2 - P1)
 #  The firmware computes blockPositionFt (authoritative), velocityFtMin,
-#  direction (UP/ON BOTTOM/DOWN/STOPPED), calStatus and currentLayer. The
+#  calStatus and currentLayer. The
 #  dashboard DISPLAYS those verbatim — it never maintains a competing
 #  measurement calculation (it only mirrors the interpolation for precondition
 #  checks / demo).
@@ -64,21 +64,26 @@ if parent_dir not in sys.path:
 
 # --- Absolute imports (package name required) ---
 from scarlet_test_panel.config import (
-    BG_MAIN, BG_CARD, BG_INNER, TEXT_DARK, TEXT_MID, BORDER,
+    BG_MAIN, BG_CARD, BG_INNER, TEXT_DARK, TEXT_MID, TEXT_ON_DARK, BORDER,
     NUM_ANALOG, SENSOR_CONFIG, SPM_CONFIG, RPM_CONFIG,
     MS_PER_SAMPLE, SAMPLES_PER_SEC, WINDOW_SECS, RETAIN_SAMPLES, HISTORY_LEN,
     SESSION_START, AUDIT_DB_PATH, HISTORIAN_DB_PATH, HISTORIAN_RETENTION_DAYS,
     STALE_TIMEOUT_S, LINK_TIMEOUT_S, RECONNECT_BACKOFF_S,
     DEVICE_DEFAULTS, CMD_ACK_TIMEOUT_S,
-    FW_MAX_CAL_POINTS, FW_WITS_CORRECTION_DEFAULT,
+    FW_MAX_CAL_POINTS, FW_WITS_CORRECTION_DEFAULT, ON_BOTTOM_EPS_FT,
     DEMO_CAL_POINTS, DEMO_WITS_CORRECTION, DEMO_MAX_COUNT,
+    DEMO_PIPE_IN_HOLE_FT,
+    TREND_SAMPLE_MS, TREND_MAX_POINTS,
+    BIT_POS_STATE_STABLE_TICKS,
 )
 from scarlet_test_panel.utils import resource_path
 from scarlet_test_panel.widgets.tab_bar import TabBar
 from scarlet_test_panel.widgets.status_bar import StatusBar
 from scarlet_test_panel.tabs.analog_tab import AnalogTab
+from scarlet_test_panel.tabs.sensors_tab import SensorsTab
 from scarlet_test_panel.tabs.graph_tab import GraphTab
 from scarlet_test_panel.tabs.spm_rpm_tab import StrokeRpmTab
+from scarlet_test_panel.tabs.analog_monitor_tab import AnalogMonitorTab
 from scarlet_test_panel.tabs.block_position_tab import BlockPositionTab
 
 # --- Design tokens (light/dark theme) ---
@@ -86,13 +91,15 @@ import scarlet_test_panel.theme as theme
 from scarlet_test_panel.theme import current as theme_current
 
 # --- Production services ---
-from scarlet_test_panel.services.protocol import decode_message, BadChecksum, MessageError
-from scarlet_test_panel.services.security import RoleManager, ROLE_OPERATOR
+from scarlet_test_panel.services.protocol import (
+    decode_message, BadChecksum, MessageError, SENSOR_STATUS_CHARS)
+from scarlet_test_panel.services.security import RoleManager, ROLE_OPERATOR, ROLE_ENGINEER
 from scarlet_test_panel.services.audit import AuditLog
 from scarlet_test_panel.services.historian import Historian
 from scarlet_test_panel.services.commands import CommandTracker
 from scarlet_test_panel.services.settings import load as load_settings, save as save_settings
 from scarlet_test_panel.services import layers as layers_service
+from scarlet_test_panel.services import digital_calibration as digcal
 
 # --- Qt imports ---
 from PyQt5.QtWidgets import (
@@ -121,7 +128,7 @@ CAL_PERSIST_KEYS = tuple(
 class PumpDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Industrial Rig Block Position Monitor")
+        self.setWindowTitle("")
         self.setStyleSheet(f"background-color: {theme_current().color_name('BG_MAIN')};")
         self.serial = None
         self._demo_mode = False
@@ -133,7 +140,7 @@ class PumpDashboard(QMainWindow):
 
         # ── Production services ──────────────────────────────
         self._settings = load_settings()
-        theme.set_theme(self._settings.get("theme", "light"))
+        theme.set_theme(self._settings.get("theme", "red"))
         theme.refresh_shortcuts()
         self.roles = RoleManager(self._settings.get("role", ROLE_OPERATOR))
         self.audit = AuditLog(AUDIT_DB_PATH, default_actor="system")
@@ -153,6 +160,7 @@ class PumpDashboard(QMainWindow):
 
         # Analog (16-channel) state
         self.analog_voltages = [0.0] * NUM_ANALOG
+        self.analog_statuses = [""] * NUM_ANALOG
         self.histories = [deque(maxlen=HISTORY_LEN) for _ in range(NUM_ANALOG)]
         for h in self.histories:
             h.append((0.0, 0.0, datetime.datetime.now()))
@@ -161,10 +169,22 @@ class PumpDashboard(QMainWindow):
         # SPM / RPM state
         self.spm_raw_counter = [0.0] * 4
         self.spm_offset = [0.0] * 4
+        # spm_measured / rpm_measured are the RAW device reports; spm_values /
+        # rpm_values are the CALIBRATED numbers every consumer reads
+        # (digitalsensor1.txt §11/§17). The distinction exists so the Engineer
+        # can always see the underlying signal, never to create a second
+        # calculation path.
+        self.spm_measured = [0.0] * 4
         self.spm_values = [0.0] * 4
         self.rpm_raw_counter = [0.0] * 2
         self.rpm_offset = [0.0] * 2
+        self.rpm_measured = [0.0] * 2
         self.rpm_values = [0.0] * 2
+        # Independent per-channel digital calibration (digitalsensor1.txt). Loaded
+        # ONCE here and refreshed only when a save happens, so the 20 Hz tick
+        # never touches the settings file.
+        self._dig_cal = {"SPM": [None] * 4, "RPM": [None] * 2}
+        self.reload_digital_calibration()
 
         # ── Block Position Monitor live telemetry ─────────────
         # Values here DISPLAY what the firmware reported (report/status).
@@ -172,8 +192,70 @@ class PumpDashboard(QMainWindow):
         self.current_ticks = 0
         self.block_position_ft = 0.0
         self.velocity_ft_min = 0.0
-        self.direction = "STOPPED"
+        self.direction = "DOWN"     # UP/DOWN only; derived from the live tick delta
+        self._direction_prev_tick = None
+        # RESET FEET runtime reference (local/demo mode). Used to re-reference
+        # the position so it reads the operator's chosen starting feet at the
+        # reset instant and tracks movement relative to it. Calibration is
+        # NEVER modified. On the live (firmware) path the device itself holds
+        # the equivalent reference, so these fields only affect the demo sweep.
+        self._runtime_reference_active = False
+        self._runtime_reference_offset = 0.0
         self.on_bottom = False          # stopped near the lowest calibrated anchor
+        # String Length feature (promt.txt): user-defined Pipe in Hole (ft).
+        # None = not configured; float >= 0 = saved value in feet.
+        self.pipe_in_hole_ft = None
+        self._bit_hold_ft = None  # seeded from the saved Pipe in Hole below
+        self._load_pipe_in_hole()
+        # SLIP WINDOW (promt.txt §18): seconds the state must hold before the
+        # TRACK/HOLD transition applies. None = built-in default.
+        self.slip_window_sec = None
+        self._load_slip_window()
+        # SLIP WINDOW load/time confirmation (slip_window.txt): Hookload (k-lb)
+        # threshold + confirmation span (seconds). None = feature off, existing
+        # TRACK/HOLD gating unchanged.
+        self.slip_window_load_klb = None
+        self.slip_window_time_sec = None
+        self._load_slip_window_config()
+        # SAMPLE LAG DEPTH derived display (promt3 §15): operator lag offset.
+        self.sample_lag_offset_ft = 0.0
+        self._load_sample_lag_offset()
+        # Slip-window confirmation state machine.
+        self._slip_state = "NOT ACTIVE"   # NOT ACTIVE | CONFIRMING | CONFIRMED
+        self._slip_since = None           # _slip_clock() when CONFIRMING began
+        self._slip_clock = time.monotonic  # injectable for deterministic tests
+        # Analog-hookload-conditioned BIT POSITION / STRING LENGTH state
+        # machine (promt.txt). Pipe-load is proven by the Analog Monitor's
+        # live channel-0 Hookload (single hookload source):
+        #   * NONE  - pipe in hole not yet configured (nothing to show).
+        #   * HOLD  - no pipe load proven (hookload <= 0, or the Slip Window
+        #             confirmation is not yet CONFIRMED): the bit position is
+        #             frozen at the last valid depth, so small block movement /
+        #             sensor noise never creeps it.
+        #   * TRACK - pipe load proven: bit depth = String Length - Block
+        #             Position, i.e. Bit moves opposite to the block while
+        #             String Length = Block + Bit stays constant for the trip.
+        # `_bit_hold_ft` keeps the last valid depth through HOLD windows and
+        # starts at the entered Pipe in Hole (the flat string), so the bit is
+        # initialised from a valid value before the first trip. After every
+        # advance `pipe_in_hole_ft` is kept in lock-step with the live bit
+        # (Pipe in Hole == current Bit Position, never a stale number).
+        # `_bit_track_block_ft` is the previous Block Position while tracking:
+        # the bit is driven by the ACTUAL block delta (promt.txt §4/§13/§16),
+        # never by continuously re-deriving it from a String Length reference.
+        # It is re-anchored to the live block every time the state re-enters
+        # TRACK, so re-engagement never jumps (promt.txt §12).
+        # State transitions are debounced for BIT_POS_STATE_STABLE_TICKS.
+        self._bit_state = "NONE"
+        self._bit_want = None
+        self._bit_confirm_ct = 0
+        self._bit_track_block_ft = None
+        # HOLE DEPTH (promt.txt): the deepest Bit Position the string has
+        # reached (accumulated running maximum). Non-decreasing: it HOLDS while
+        # tripping / coming out of the hole and only advances again when the
+        # bit runs deeper. None = never configured.
+        self._hole_depth_max_ft = None
+        self._hole_last_bit_ft = None
         self.cal_status = "NO_CALIBRATION"  # VALID / OUT_OF_RANGE / NO_CALIBRATION
         self.cal_in_range = 0
         self.current_layer = 1
@@ -189,6 +271,14 @@ class PumpDashboard(QMainWindow):
         self.encoder_recovered = False
         self.position_history = deque(maxlen=HISTORY_LEN)
         self.position_history.append((0.0, datetime.datetime.now()))
+
+        # ── Real-time trend (promt1.txt) ──────────────────────────────
+        # READ-ONLY trend history. Each entry is (timestamp, position_feet)
+        # sampled at a controlled interval (TREND_SAMPLE_MS) by a QTimer, so
+        # the chart never grows a point on every UI refresh. The buffer is a
+        # bounded deque -> rolling history with flat memory. Feet always stays
+        # the internal unit; meters is only a chart-display conversion.
+        self.trend_data = deque(maxlen=TREND_MAX_POINTS)
 
         self._msg_count = 0
         self._comm_errors = 0
@@ -218,6 +308,12 @@ class PumpDashboard(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self._tick)
         self.timer.start(MS_PER_SAMPLE)
+
+        # Trend sampler: a separate QTimer so sampling never blocks the UI and
+        # keeps running while the chart view is paused. (promt1.txt)
+        self._trend_timer = QTimer()
+        self._trend_timer.timeout.connect(self._record_trend_point)
+        self._trend_timer.start(TREND_SAMPLE_MS)
         self._restore_geometry()
 
     # ------------------------------------------------------------------
@@ -234,7 +330,7 @@ class PumpDashboard(QMainWindow):
 
     def _restore_geometry(self):
         avail = self._screen_available()
-        min_w, min_h = 1100, 700
+        min_w, min_h = 1024, 680
         if avail is not None:
             min_w = min(min_w, avail.width())
             min_h = min(min_h, avail.height())
@@ -268,62 +364,51 @@ class PumpDashboard(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setSpacing(8)
-        root.setContentsMargins(14, 14, 14, 10)
+        root.setContentsMargins(14, 0, 14, 10)
 
-        top_bar = QHBoxLayout()
-        top_bar.setContentsMargins(0, 0, 0, 4)
+        # Top chrome: the logo row is collapsed (0px) and grouped with the tab
+        # bar in a 1px-gap sub-layout, so the only space above the menu buttons
+        # is 1px. Every other gap in `root` keeps its original 8px.
+        # The date/time clock lives in the fixed bottom bar (added to the
+        # StatusBar further down), not up here.
+        top_area = QVBoxLayout()
+        top_area.setContentsMargins(0, 0, 0, 0)
+        top_area.setSpacing(1)
+        top_bar_host = QWidget()
+        top_bar_host.setFixedHeight(0)
+        top_bar = QHBoxLayout(top_bar_host)
+        top_bar.setContentsMargins(1, 1, 1, 1)
         top_bar.setSpacing(10)
         logo_label = QLabel()
         logo_pixmap = QPixmap(resource_path("scarletIcon.jpg"))
         if not logo_pixmap.isNull():
-            logo_pixmap = logo_pixmap.scaledToHeight(52, Qt.SmoothTransformation)
+            logo_pixmap = logo_pixmap.scaledToHeight(4, Qt.SmoothTransformation)
             logo_label.setPixmap(logo_pixmap)
         else:
             lp2 = QPixmap(resource_path("scarletIcon.ico"))
             if not lp2.isNull():
-                lp2 = lp2.scaledToHeight(52, Qt.SmoothTransformation)
+                lp2 = lp2.scaledToHeight(4, Qt.SmoothTransformation)
                 logo_label.setPixmap(lp2)
         logo_label.setStyleSheet("background: transparent;")
         logo_label.setFixedWidth(0 if logo_pixmap.isNull() else logo_pixmap.width())
-        title = QLabel("INDUSTRIAL RIG\nBLOCK POSITION MONITOR")
-        title.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        title.setStyleSheet(
-            f"color:{TEXT_DARK.name()}; font-family:'Segoe UI'; font-size:16px; "
-            f"font-weight:bold; letter-spacing:2px; padding:0; background:transparent;")
+        logo_label.setFixedHeight(4)
         top_bar.addWidget(logo_label)
-        top_bar.addWidget(title)
         top_bar.addStretch()
+        top_area.addWidget(top_bar_host)
 
-        # Header status cluster: connection + data state + clock + user.
+        # Session date/time clock — re-homed to the fixed bottom bar below.
         self.hdr_dt_lbl = QLabel("")
         self.hdr_dt_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.hdr_dt_lbl.setStyleSheet(
-            f"color:{TEXT_MID.name()}; font-family:'Segoe UI'; font-size:11px; "
+            f"color:{TEXT_ON_DARK.name()}; font-family:'Segoe UI'; font-size:11px; "
             "background:transparent;")
-        self.hdr_user_lbl = QLabel("User: --")
-        self.hdr_user_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.hdr_user_lbl.setStyleSheet(
-            f"color:{TEXT_MID.name()}; font-family:'Segoe UI'; font-size:11px; "
-            "background:transparent;")
-        self.hdr_status_lbl = QLabel("NORMAL")
-        self.hdr_status_lbl.setAlignment(Qt.AlignCenter)
-        self.hdr_status_lbl.setStyleSheet(
-            "color:#FFFFFF; background:#1E7A3E; font-family:'Segoe UI'; "
-            "font-size:11px; font-weight:bold; border-radius:9px; padding:5px 12px;")
-        self.hdr_conn_lbl = QLabel("DISCONNECTED")
-        self.hdr_conn_lbl.setAlignment(Qt.AlignCenter)
-        self.hdr_conn_lbl.setStyleSheet(
-            "color:#FFFFFF; background:#C0392B; font-family:'Segoe UI'; "
-            "font-size:11px; font-weight:bold; border-radius:9px; padding:5px 12px;")
-        top_bar.addWidget(self.hdr_dt_lbl)
-        top_bar.addWidget(self.hdr_user_lbl)
-        top_bar.addWidget(self.hdr_status_lbl)
-        top_bar.addWidget(self.hdr_conn_lbl)
-        root.addLayout(top_bar)
+        self.hdr_dt_lbl.setFixedHeight(15)
 
-        self.tab_bar = TabBar(["  Analog Signals  ", "  Graph  ", "  SPM / RPM  ",
-                               "  Block Position  ", "  Settings  ", "  Diagnostics  "])
-        root.addWidget(self.tab_bar)
+        self.tab_bar = TabBar(["  Analog Signals  ", "  Dashboard  ",
+                               "  Block Position  ", "  Analog Monitor  ",
+                               "  Graph  ", "  Digital Sensor  ", "  Settings  "])
+        top_area.addWidget(self.tab_bar)
+        root.addLayout(top_area)
         self._root_sep = QFrame()
         self._root_sep.setFrameShape(QFrame.HLine)
         self._root_sep.setStyleSheet(f"background:{BORDER.name()}; max-height:1px; border:none;")
@@ -342,36 +427,66 @@ class PumpDashboard(QMainWindow):
         self.analog_tab = AnalogTab(self)
         self.stack.addWidget(self.analog_tab)
 
-        self.graph_tab = GraphTab(self.histories, self.epoch_samples)
-        self.stack.addWidget(self.graph_tab)
-        self.graph_card = self.graph_tab.graph_card
-
-        self.stroke_tab = StrokeRpmTab(self)
-        self.stack.addWidget(self.stroke_tab)
+        # Tab order: the live monitoring pages sit directly after the Dashboard
+        # (Dashboard -> Block Position -> Analog Monitor), then the remaining
+        # engineering pages. Every index below is named so no call site has to
+        # remember a magic number.
+        self.sensors_tab = SensorsTab(self)
+        self.stack.addWidget(self.sensors_tab)
 
         self.block_tab = BlockPositionTab(self, self.roles, self.audit)
         self.stack.addWidget(self.block_tab)
 
-        from scarlet_test_panel.tabs.about_tab import AboutTab
-        self.about_tab = AboutTab(self, self.audit)
-        self.stack.addWidget(self.about_tab)
+        self.analog_monitor_tab = AnalogMonitorTab(self, self.roles, self.audit)
+        self.stack.addWidget(self.analog_monitor_tab)
 
-        from scarlet_test_panel.tabs.diagnostics_tab import DiagnosticsTab
-        self.diagnostics_tab = DiagnosticsTab(self, self.roles)
-        self.stack.addWidget(self.diagnostics_tab)
+        self.graph_tab = GraphTab(self.histories, self.epoch_samples)
+        self.stack.addWidget(self.graph_tab)
+        self.graph_card = self.graph_tab.graph_card
+
+        from scarlet_test_panel.tabs.digital_sensor_tab import DigitalSensorTab
+        self.digital_sensor_tab = DigitalSensorTab(self, self.roles)
+        self.stack.addWidget(self.digital_sensor_tab)
+
+        # Must match the addWidget order above.
+        self.IDX_ANALOG_SIGNALS = 0
+        self.IDX_DASHBOARD = 1
+        self.IDX_BLOCK_POSITION = 2
+        self.IDX_ANALOG_MONITOR = 3
+        self.IDX_GRAPH = 4
+        self.IDX_DIGITAL_SENSORS = 5
+        self.IDX_SETTINGS = 6
 
         self.tab_bar.on_change(self.stack.setCurrentIndex)
 
+        # "Analog Signals" is no longer shown in the menu — only its BUTTON is
+        # hidden. The page stays in the stack on purpose: live telemetry still
+        # feeds its gauges (see _on_telemetry) and the Analog Monitor
+        # calibration dialogs call into it, so removing the widget would break
+        # those. The app now opens on "Dashboard".
+        self.tab_bar.set_tab_visible(self.IDX_ANALOG_SIGNALS, False)
+        self.tab_bar.set_current(self.IDX_DASHBOARD)
+
         # Diagnostics/engineering page is Supervisor/Engineer-only.
         def _apply_diag_role(role):
-            visible = self.roles.can_command()
-            self.tab_bar.set_tab_visible(5, visible)
-            if not visible and self.stack.currentIndex() == 5:
-                self.stack.setCurrentIndex(3)
-        self.roles.subscribe(_apply_diag_role)
-        _apply_diag_role(self.roles.role())
+            try:
+                if not hasattr(self, "IDX_DIAGNOSTICS"):
+                    return
+                visible = getattr(self.roles, "can_command", lambda: False)() or role in ("Supervisor", "Engineer", "admin")
+                self.tab_bar.set_tab_visible(self.IDX_DIAGNOSTICS, visible)
+                if not visible and self.stack.currentIndex() == self.IDX_DIAGNOSTICS:
+                    self.stack.setCurrentIndex(getattr(self, "IDX_BLOCK_POSITION", 0))
+            except Exception:
+                pass
+        try:
+            self.roles.subscribe(_apply_diag_role)
+            _apply_diag_role(self.roles.role())
+        except Exception:
+            pass
 
         self.status = StatusBar(self.roles, self.audit, self)
+        # Date/time clock now rides the fixed bottom bar (last cell, right edge).
+        self.status.layout().addWidget(self.hdr_dt_lbl)
         root.addWidget(self.status)
         self.status.connect_btn.clicked.connect(self._toggle_serial)
         self.status.demo_btn.clicked.connect(self._toggle_demo)
@@ -398,6 +513,14 @@ class PumpDashboard(QMainWindow):
             self.about_tab.apply_theme(name)
         if hasattr(self, "diagnostics_tab"):
             self.diagnostics_tab.apply_theme(name)
+        if hasattr(self, "analog_monitor_tab"):
+            self.analog_monitor_tab.apply_theme(name)
+        if hasattr(self, "sensors_tab"):
+            self.sensors_tab.apply_theme(name)
+        if hasattr(self, "digital_sensor_tab"):
+            self.digital_sensor_tab.apply_theme(name)
+        if hasattr(self, "stroke_tab"):
+            self.stroke_tab.apply_theme(name)
         save_settings({"theme": name})
 
     # ------------------------------------------------------------------
@@ -412,7 +535,7 @@ class PumpDashboard(QMainWindow):
             self.status.refresh_ports()
             return
         port = port_label.split("  [", 1)[0]
-        baud = int(self.status.baud_cb.currentText()) if self.status.baud_cb.currentText().isdigit() else 9600
+        baud = int(self.status.baud_cb.currentText()) if self.status.baud_cb.currentText().isdigit() else 115200
         try:
             self.serial = serial.Serial(port=port, baudrate=baud, timeout=0)
             self._serial_rx_buffer.clear()
@@ -535,41 +658,42 @@ class PumpDashboard(QMainWindow):
         self._update_header()
 
         idx = self.stack.currentIndex()
-        if idx == 1:
+        if idx == self.IDX_DASHBOARD:
+            self.sensors_tab.refresh()
+        elif idx == self.IDX_GRAPH:
             self.graph_card.refresh()
-        elif idx == 2:
-            self.stroke_tab.refresh()
-        elif idx == 3:
+        elif idx == self.IDX_DIGITAL_SENSORS:
+            self.digital_sensor_tab.refresh()
+        elif idx == self.IDX_BLOCK_POSITION:
             self.block_tab.refresh()
-        elif idx == 4:
+        elif idx == self.IDX_SETTINGS:
             self.about_tab.refresh()
-        elif idx == 5:
-            self.diagnostics_tab.refresh()
+        elif idx == self.IDX_ANALOG_MONITOR:
+            self.analog_monitor_tab.refresh()
         self.status.refresh_state(self._data_stale, self._link_down)
 
     def _update_header(self):
         self.hdr_dt_lbl.setText(datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
-        self.hdr_user_lbl.setText(f"User: {self.roles.role().upper()}")
-
-        if self._link_down:
-            text, bg = "DISCONNECTED", "#C0392B"
-        elif self._data_stale:
-            text, bg = "STALE DATA", "#8A5A00"
-        else:
-            text, bg = "NORMAL", "#1E7A3E"
-        self.hdr_status_lbl.setText(text)
-        self.hdr_status_lbl.setStyleSheet(
-            f"color:#FFFFFF; background:{bg}; font-family:'Segoe UI'; "
-            "font-size:11px; font-weight:bold; border-radius:9px; padding:5px 12px;")
-
-        conn = bool(self.serial and self.serial.is_open and not self._link_down)
-        self.hdr_conn_lbl.setText("CONNECTED" if conn else "DISCONNECTED")
-        self.hdr_conn_lbl.setStyleSheet(
-            f"color:#FFFFFF; background:{'#1E7A3E' if conn else '#C0392B'}; "
-            "font-family:'Segoe UI'; font-size:11px; font-weight:bold; "
-            "border-radius:9px; padding:5px 12px;")
 
     # -- freshness / stale & link detection -----------------------------
+    def _return_role_to_operator(self):
+        """promt.txt: after a successful Engineer modification, immediately
+        return the role to OPERATOR. Only acts when an ENGINEER session is
+        active; real-time monitoring data is unaffected by the role change."""
+        try:
+            if self.roles.is_engineer():
+                actor = self.roles.role()
+                self.roles.set_role(ROLE_OPERATOR)
+                try:
+                    self.audit.record(
+                        "ROLE_CHANGE",
+                        "Engineer auto-return to OPERATOR after modification",
+                        actor)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _check_freshness(self):
         now = time.monotonic()
         if self._demo_mode:
@@ -605,7 +729,7 @@ class PumpDashboard(QMainWindow):
             return
         self._connect_backoff_until = now + RECONNECT_BACKOFF_S
         port = self.status.port_cb.currentText().split("  [", 1)[0]
-        baud = int(self.status.baud_cb.currentText()) if self.status.baud_cb.currentText().isdigit() else 9600
+        baud = int(self.status.baud_cb.currentText()) if self.status.baud_cb.currentText().isdigit() else 115200
         try:
             self.serial.close()
         except Exception:
@@ -706,12 +830,16 @@ class PumpDashboard(QMainWindow):
         self._data_stale = False
         self._crc_failures = 0
         self.status.set_link_quality(1.0)
+        self._apply_analog_telemetry(data)
 
         if mtype == "ack":
             self._handle_ack(data)
             return
         if mtype == "status":
             self._handle_status(data)
+            # A status reply completes an outstanding capture_tick() request
+            # (promt2: CAPTURE reads the Arduino's authoritative currentTicks).
+            self._cmd.on_status(data)
             return
         if mtype == "reset_ack":
             self._handle_reset_ack(data)
@@ -754,6 +882,28 @@ class PumpDashboard(QMainWindow):
         self.encoder_uptime_s = new_up
 
     # -- STATUS snapshot --------------------------------------------------
+    def _derive_direction(self, new_ticks):
+        """UP/DOWN-only direction derived from the live encoder tick delta.
+
+        Rule (promt2): if currentTick > previousTick -> UP; if currentTick <
+        previousTick -> DOWN; if they are EQUAL keep the last valid direction.
+        Direction is NEVER reported as NONE/IDLE/STOPPED. On the very first
+        sample the initial default (DOWN) is preserved until real movement is
+        observed."""
+        try:
+            new_ticks = int(new_ticks)
+        except (TypeError, ValueError):
+            return
+        prev = self._direction_prev_tick
+        if prev is None:
+            self._direction_prev_tick = new_ticks
+            return
+        self._direction_prev_tick = new_ticks
+        if new_ticks > prev:
+            self.direction = "UP"
+        elif new_ticks < prev:
+            self.direction = "DOWN"
+
     def _handle_status(self, data):
         self.encoder_fw_version = data.get("fw_version", "") or ""
         self.encoder_build = data.get("build", "") or ""
@@ -773,8 +923,7 @@ class PumpDashboard(QMainWindow):
             self._set_block_position(float(data["blockPositionFt"]))
         if "velocityFtMin" in data:
             self.velocity_ft_min = float(data["velocityFtMin"])
-        if "direction" in data:
-            self.direction = str(data["direction"])
+        self._derive_direction(self.current_ticks)
         if "onBottom" in data:
             self.on_bottom = str(data["onBottom"]).lower() in ("1", "true", "yes")
         if "calStatus" in data:
@@ -802,8 +951,7 @@ class PumpDashboard(QMainWindow):
             self._set_block_position(float(data["blockPositionFt"]))
         if "velocityFtMin" in data:
             self.velocity_ft_min = float(data["velocityFtMin"])
-        if "direction" in data:
-            self.direction = str(data["direction"])
+        self._derive_direction(self.current_ticks)
         if "onBottom" in data:
             self.on_bottom = str(data["onBottom"]).lower() in ("1", "true", "yes")
         if "calStatus" in data:
@@ -831,8 +979,7 @@ class PumpDashboard(QMainWindow):
                 self._set_block_position(float(data["blockPositionFt"]))
             if "velocityFtMin" in data:
                 self.velocity_ft_min = float(data["velocityFtMin"])
-            if "direction" in data:
-                self.direction = str(data["direction"])
+            self._derive_direction(self.current_ticks)
             if "onBottom" in data:
                 self.on_bottom = str(data["onBottom"]).lower() in ("1", "true", "yes")
             if "calStatus" in data:
@@ -867,6 +1014,7 @@ class PumpDashboard(QMainWindow):
                               f"device confirmed counter reset (currentTicks=0) "
                               f"source={source} detail={detail}",
                               "system", uptime=self.encoder_uptime_s)
+            self._return_role_to_operator()
         elif ok and verified is False:
             # No in-flight request matched (physical button press). Still a
             # legitimate, device-confirmed reset.
@@ -875,6 +1023,7 @@ class PumpDashboard(QMainWindow):
                               "device confirmed counter reset via physical button "
                               "(currentTicks=0)",
                               "system", uptime=self.encoder_uptime_s)
+            self._return_role_to_operator()
         else:
             self._set_reset_state(False, "reset_ack reported a NON-ZERO counter")
             self.audit.record("RESET_FAILED",
@@ -887,12 +1036,12 @@ class PumpDashboard(QMainWindow):
         # dashboard never shows stale velocity/direction/position after a reset
         # (the next periodic report may be up to DATA_PERIOD_MS away). The
         # reset_ack carries the device-confirmed values; when a field is absent
-        # (older firmware) fall back to the reset invariants: velocity 0,
-        # direction STOPPED.
+        # (older firmware) fall back to the reset invariants: velocity 0;
+        # direction is re-derived from the tick delta (UP/DOWN only).
         if "blockPositionFt" in data:
             self._set_block_position(float(data["blockPositionFt"]))
         self.velocity_ft_min = float(data.get("velocityFtMin") or 0.0)
-        self.direction = str(data.get("direction") or "STOPPED")
+        self._derive_direction(self.current_ticks)
         if "onBottom" in data:
             self.on_bottom = str(data["onBottom"]).lower() in ("1", "true", "yes")
         if "calStatus" in data:
@@ -905,40 +1054,75 @@ class PumpDashboard(QMainWindow):
 
     def _handle_reset_feet_ack(self, data):
         """RESET FEET — runtime position only. Confirmation is shown ONLY after
-        the device confirms currentTicks == 0 and blockPositionFt == 0.00 ft.
-        The saved calibration anchors are never touched; this only re-establishes
-        the temporary runtime zero reference (tick=0 -> 0.00 ft)."""
+        the device confirms currentTicks == 0 AND blockPositionFt equals the
+        requested NEW starting position (default 0.00 ft, or any user-supplied
+        starting feet). The saved calibration anchors are never touched; this
+        only re-establishes the temporary runtime reference (tick=0 ->
+        user starting feet)."""
         self._track_uptime(data)
         raw_ticks = data.get("currentTicks")
         raw_pos = data.get("blockPositionFt")
-        ok = (raw_ticks is not None and int(float(raw_ticks)) == 0
-              and raw_pos is not None and abs(float(raw_pos)) < 1e-9)
+        ticks_ok = (raw_ticks is not None and int(float(raw_ticks)) == 0)
+        try:
+            new_pos = float(raw_pos) if raw_pos is not None else 0.0
+        except (TypeError, ValueError):
+            new_pos = 0.0
         source = data.get("source") or "device"
+        # Capture the requested reference BEFORE on_reset_feet_ack() resolves
+        # (and pops) the pending request, so a failed verify can still report
+        # the operator-entered starting feet in the banner.
+        req_expected = None
+        try:
+            rid = int(data.get("req_id") or 0)
+            pending = self._cmd._pending
+            req_obj = pending.get(rid)
+            if req_obj is None:
+                # Older firmware acks omit req_id — capture the single pending
+                # reset_feet request's requested reference for the diagnostic.
+                for r in pending.values():
+                    if r.cmd == "reset_feet":
+                        req_obj = r
+                        break
+            if req_obj is not None:
+                req_expected = dict(req_obj.expected)
+        except Exception:
+            req_expected = None
         verified = self._cmd.on_reset_feet_ack(data)
 
-        if verified == "verified" or (ok and verified is False):
+        if verified == "verified":
             self._set_reset_state(
-                True, "RESET FEET SUCCESSFUL — Encoder Tick: 0   "
-                      "Block Position: 0.00 FT")
+                True, f"STARTING POSITION RESET SUCCESSFULLY — "
+                      f"New Starting Position: {new_pos:.2f} FT")
             self.audit.record("RESET_FEET",
-                              f"device confirmed runtime reset (tick=0, position=0.00 ft) "
+                              f"device confirmed new runtime reference "
+                              f"(tick=0, start={new_pos:.2f} ft) "
                               f"source={source} — calibration untouched",
                               "system", uptime=self.encoder_uptime_s)
         else:
-            self._set_reset_state(
-                False, "RESET FEET FAILED — device reported non-zero tick/position")
+            # Device confirmed the tick but echoed a position that does NOT
+            # match the operator-entered starting feet. The classic 0.00
+            # response means the flashed firmware predates the `value` field
+            # (starting-feet support, FW 4.1+) and must be reflashed.
+            detail = "RESET POSITION FAILED — device did not confirm the new reference"
+            if ticks_ok and raw_pos is not None:
+                want = float(req_expected.get("blockPositionFt", 0.0)) \
+                    if req_expected else 0.0
+                detail += (f" (device returned {new_pos:.2f} ft, "
+                           f"requested {want:.2f} ft)")
+            self._set_reset_state(False, detail)
             self.audit.record("RESET_FEET_FAILED",
                               f"reset_feet_ack tick={raw_ticks} pos={raw_pos}",
                               "system", uptime=self.encoder_uptime_s)
         self.encoder_recovered = False
-        if ok:
+        if ticks_ok:
             self.current_ticks = 0
-        # Immediately reflect the new runtime zero reference. NOTE: this sets
-        # the runtime block position to 0.00 ft directly — it does NOT recompute
-        # from calibration (the calibration table is intentionally left intact).
-        self._set_block_position(0.0)
+        # Immediately reflect the new runtime reference. NOTE: the block
+        # position is set directly to the device-confirmed starting feet — it
+        # does NOT recompute from calibration (the calibration table is kept
+        # intentionally unchanged).
+        self._set_block_position(new_pos)
         self.velocity_ft_min = float(data.get("velocityFtMin") or 0.0)
-        self.direction = str(data.get("direction") or "STOPPED")
+        self._derive_direction(self.current_ticks)
         if "onBottom" in data:
             self.on_bottom = str(data["onBottom"]).lower() in ("1", "true", "yes")
         if "calStatus" in data:
@@ -1007,6 +1191,49 @@ class PumpDashboard(QMainWindow):
         self.block_position_ft = ft
         self.position_history.append((ft, datetime.datetime.now()))
 
+    # -- real-time trend (promt1.txt) ---------------------------------------
+    # The trend is READ-ONLY. These methods only *record* the existing
+    # authoritative live position (block_position_ft) into a bounded rolling
+    # buffer. They never touch encoder ticks, calibration, wraps, velocity or
+    # the Arduino link.
+    def _record_trend_point(self):
+        """QTimer slot: controlled 1 Hz trend sample.
+
+        Appends (timestamp, feet) for the EXACT live position currently shown
+        on the dashboard. Runs even while the chart view is PAUSED — pausing
+        only freezes the display, recording continues.
+        """
+        self.trend_data.append(
+            (datetime.datetime.now(), float(self.block_position_ft or 0.0)))
+
+    def clear_trend(self):
+        """CLEAR TREND — drop ONLY the trend history.
+
+        Encoder tick, block position, calibration, wraps and the Arduino link
+        all keep running; the chart simply restarts collecting live data.
+        """
+        self.trend_data.clear()
+        self.audit.record("TREND", "CLEAR TREND - chart history cleared",
+                          "operator")
+
+    def set_runtime_reference(self, base_abs_ft, start_ft):
+        """Re-reference the position (RESET FEET, local/demo mode). Records the
+        absolute calibrated position `base_abs_ft` at the reset instant so the
+        position reads `start_ft` right now and tracks movement relative to it.
+        Calibration is NEVER modified. (Live firmware path has its own reference
+        on the device and does not use this.)
+        """
+        self._runtime_reference_active = True
+        self._runtime_reference_offset = float(base_abs_ft) - float(start_ft)
+
+    def display_position_from_calibration(self, abs_ft):
+        """Apply the active RESET FEET reference to an absolute calibrated
+        position. Used by the demo sweep so it continues tracking from the
+        operator's chosen starting feet."""
+        if self._runtime_reference_active:
+            return float(abs_ft) - self._runtime_reference_offset
+        return float(abs_ft)
+
     def _write_historian(self):
         self.historian.record(self.block_position_ft, int(self.current_ticks),
                               source="firmware", is_recovered=self.encoder_recovered)
@@ -1018,14 +1245,7 @@ class PumpDashboard(QMainWindow):
         self._data_stale = False
         self.status.set_link_quality(0.5)
 
-        for i in range(NUM_ANALOG):
-            key = f"sensor{i+1}"
-            if key in data:
-                try:
-                    v = max(0.0, min(5.0, float(data[key])))
-                    self._push_analog(i, v)
-                except (TypeError, ValueError):
-                    continue
+        self._apply_analog_telemetry(data)
 
         for i, cfg in enumerate(SPM_CONFIG):
             if cfg["counter_key"] in data:
@@ -1035,9 +1255,18 @@ class PumpDashboard(QMainWindow):
                     pass
             if cfg["spm_key"] in data:
                 try:
-                    self.spm_values[i] = float(data[cfg["spm_key"]])
+                    raw = float(data[cfg["spm_key"]])
                 except (TypeError, ValueError):
-                    pass
+                    raw = None
+                if raw is not None:
+                    # RAW / MEASURED stays visible for the calibration windows;
+                    # spm_values is the single CALIBRATED source every
+                    # consumer (Dashboard, Digital Sensor, Total SPM) reads.
+                    self.spm_measured[i] = raw
+                    calibrated = digcal.calibrated_value(
+                        "SPM", self._dig_cal["SPM"][i], raw)
+                    if calibrated is not None:
+                        self.spm_values[i] = calibrated
 
         for i, cfg in enumerate(RPM_CONFIG):
             if cfg["counter_key"] in data:
@@ -1047,7 +1276,53 @@ class PumpDashboard(QMainWindow):
                     pass
             if cfg["rpm_key"] in data:
                 try:
-                    self.rpm_values[i] = float(data[cfg["rpm_key"]])
+                    raw = float(data[cfg["rpm_key"]])
+                except (TypeError, ValueError):
+                    raw = None
+                if raw is not None:
+                    self.rpm_measured[i] = raw
+                    calibrated = digcal.calibrated_value(
+                        "RPM", self._dig_cal["RPM"][i], raw)
+                    if calibrated is not None:
+                        self.rpm_values[i] = calibrated
+
+    def _apply_analog_telemetry(self, data):
+        """Ingest the 16-channel analog bank from any message that carries it.
+
+        protocol 4.2: the periodic report appends ``sensor1..sensor16``
+        (corrected input volts, 3 d.p.) plus ``sensorStatus`` (16-char compact
+        status string, char[i] = Sensor i).  Legacy no-CRC sources may send
+        only the sensor keys.  All parsing is additive and never raises.
+        A channel whose status is ``UNUSED`` was disabled by the dashboard and
+        is NOT sampled by the firmware (it reports a fixed 0.000 V); its
+        reported value is deliberately NOT ingested and its live channel is
+        zeroed so a floating unused input can never linger as a real reading.
+        """
+        if not isinstance(data, dict):
+            return
+        raw = data.get("sensorStatus")
+        statuses = [None] * NUM_ANALOG
+        if isinstance(raw, str):
+            for i in range(min(len(raw), NUM_ANALOG)):
+                status = SENSOR_STATUS_CHARS.get(raw[i].upper(), "INVALID")
+                if status != "NO DATA":
+                    statuses[i] = status
+                    self.analog_statuses[i] = status
+        for i in range(NUM_ANALOG):
+            if statuses[i] == "UNUSED":
+                # voltage_read.txt §4/§12/§18-T4: an unused channel must read
+                # 0.000 V, never a stale or phantom live value; its gauge shows
+                # the DISABLED state instead of a number.
+                self.analog_voltages[i] = 0.0
+                try:
+                    self.analog_tab.setDisabled(i, True)
+                except Exception:
+                    pass
+                continue
+            v = data.get(f"sensor{i + 1}")
+            if v is not None:
+                try:
+                    self._push_analog(i, max(0.0, min(5.0, float(v))))
                 except (TypeError, ValueError):
                     pass
 
@@ -1056,6 +1331,10 @@ class PumpDashboard(QMainWindow):
         cal = cfg["cal_min"] + (v / 5.0) * (cfg["cal_max"] - cfg["cal_min"])
         ts = datetime.datetime.now()
         self.analog_voltages[i] = v
+        try:
+            self.analog_tab.setDisabled(i, False)
+        except Exception:
+            pass
         self.analog_tab.setVoltage(i, v)
         self.histories[i].append((v, cal, ts))
         self.epoch_samples[i] += 1
@@ -1072,7 +1351,79 @@ class PumpDashboard(QMainWindow):
     def reset_rpm(self, i):
         self.rpm_offset[i] = self.rpm_raw_counter[i]
 
+    # -- DIGITAL SENSOR CALIBRATION (digitalsensor1.txt) -----------------
+    def reload_digital_calibration(self):
+        """Re-read the per-channel SPM/RPM calibrations from the existing
+        settings store and re-apply them to the values already on screen, so a
+        saved curve takes effect immediately (the UI can never show the new
+        calibration while the engine keeps using the old one)."""
+        try:
+            self._dig_cal = digcal.load_all()
+        except Exception:
+            self._dig_cal = {"SPM": [None] * len(SPM_CONFIG),
+                             "RPM": [None] * len(RPM_CONFIG)}
+        for i in range(len(self.spm_values)):
+            calibrated = digcal.calibrated_value(
+                "SPM", self._dig_cal["SPM"][i], self.spm_measured[i])
+            if calibrated is not None:
+                self.spm_values[i] = calibrated
+        for i in range(len(self.rpm_values)):
+            calibrated = digcal.calibrated_value(
+                "RPM", self._dig_cal["RPM"][i], self.rpm_measured[i])
+            if calibrated is not None:
+                self.rpm_values[i] = calibrated
+
+    def digital_measured(self, kind, idx):
+        """RAW / MEASURED device report for one channel (never calibrated).
+
+        A channel that has never reported stays None - the page shows '--',
+        never a misleading 0."""
+        src = self.spm_measured if kind == "SPM" else self.rpm_measured
+        if not (0 <= idx < len(src)) or src[idx] is None:
+            return None
+        return float(src[idx])
+
+    def digital_value(self, kind, idx):
+        """CALIBRATED value the Dashboard already shows for one channel."""
+        src = self.spm_values if kind == "SPM" else self.rpm_values
+        if not (0 <= idx < len(src)) or src[idx] is None:
+            return None
+        return float(src[idx])
+
+    @property
+    def total_spm(self):
+        """TOTAL SPM — the sum of the four existing SPM values (single source;
+        no separate pump calculation is added). A channel that never reported
+        contributes nothing instead of breaking the sum."""
+        return float(sum(v for v in self.spm_values if v is not None))
+
+    # -- SAMPLE LAG DEPTH derived display (promt3 §15) --------------------
+    def _load_sample_lag_offset(self):
+        """Load the saved SAMPLE LAG OFFSET (ft) from settings. None/absent =
+        a 0-foot offset: Sample Lag Depth follows Measured Depth exactly."""
+        val = self._settings.get("sample_lag_offset_ft")
+        try:
+            self.sample_lag_offset_ft = float(val) if val is not None else 0.0
+        except (TypeError, ValueError):
+            self.sample_lag_offset_ft = 0.0
+        if self.sample_lag_offset_ft < 0.0:
+            self.sample_lag_offset_ft = 0.0
+
+    def set_sample_lag_offset(self, value):
+        """Save a new SAMPLE LAG OFFSET (ft). Non-negative number; returns
+        True on success (the Dashboard only reads this value)."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return False
+        if v < 0.0:
+            return False
+        self.sample_lag_offset_ft = v
+        save_settings({"sample_lag_offset_ft": v})
+        return True
+
     # -- helpers for the block tab -------------------------------------------
+
     def _persist_calibration(self):
         """Write the ACTIVE calibration table to settings.json so the
         operator's saved values become the single source of truth and survive
@@ -1173,6 +1524,418 @@ class PumpDashboard(QMainWindow):
                     break
         return pos + float(self.device.get("witsCorrectionFt", 0.0) or 0.0)
 
+    # -- String Length feature (promt.txt) ------------------------------------
+    def _load_pipe_in_hole(self):
+        """Load saved Pipe in Hole (ft) from settings. None = not configured."""
+        val = self._settings.get("pipe_in_hole")
+        if val is None:
+            self.pipe_in_hole_ft = None
+            self._bit_hold_ft = None
+            return
+        try:
+            v = float(val)
+            self.pipe_in_hole_ft = v if v >= 0.0 else None
+        except (TypeError, ValueError):
+            self.pipe_in_hole_ft = None
+        # The entered Pipe in Hole is the current bit depth of the flat string:
+        # initialise the held depth from it (promt.txt §3 idle bit = pipe in hole).
+        self._bit_hold_ft = self.pipe_in_hole_ft
+        self._bit_track_block_ft = None
+        self._bit_state = "NONE"
+        self._bit_want = None
+        self._bit_confirm_ct = 0
+
+    def set_pipe_in_hole(self, value):
+        """Save a new Pipe in Hole value (ft) to settings and runtime state.
+        Must be a non-negative number. Returns True on success."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return False
+        if v < 0.0:
+            return False
+        self.pipe_in_hole_ft = v
+        save_settings({"pipe_in_hole": v})
+        # Reset the bit track to the new flat-string depth.
+        self._bit_hold_ft = v
+        self._bit_track_block_ft = None
+        self._bit_state = "NONE"
+        self._bit_want = None
+        self._bit_confirm_ct = 0
+        return True
+
+    # -- SLIP WINDOW (promt.txt §18 hysteresis) ----------------------------
+    def _load_slip_window(self):
+        """Load the saved SLIP WINDOW (seconds) from settings. None = the
+        built-in state-stability debounce (BIT_POS_STATE_STABLE_TICKS, so
+        existing behaviour is unchanged until the operator sets a value)."""
+        val = self._settings.get("slip_window_sec")
+        if val is None:
+            self.slip_window_sec = None
+            return
+        try:
+            v = float(val)
+            self.slip_window_sec = v if v > 0.0 else None
+        except (TypeError, ValueError):
+            self.slip_window_sec = None
+
+    def _slip_stable_ticks(self):
+        """Effective state-stability debounce in refresh ticks (50 ms each) for
+        the bit TRACK/HOLD transition. Never relaxes below the built-in
+        BIT_POS_STATE_STABLE_TICKS baseline; the operator slip window only ever
+        extends it."""
+        builtin = max(1, BIT_POS_STATE_STABLE_TICKS)
+        if self.slip_window_sec is None or self.slip_window_sec <= 0.0:
+            return builtin
+        return max(builtin,
+                   int(round(float(self.slip_window_sec) * 1000.0 / MS_PER_SAMPLE)))
+
+    def set_slip_window(self, value):
+        """Save a new SLIP WINDOW (seconds) to settings and runtime state.
+        Must be a positive number. Returns True on success."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return False
+        if v <= 0.0:
+            return False
+        self.slip_window_sec = v
+        save_settings({"slip_window_sec": v})
+        return True
+
+    # -- SLIP WINDOW LOAD / TIME confirmation (slip_window.txt) -------------
+    @property
+    def slip_window_enabled(self):
+        """True when BOTH Slip Window Load (k-lb) and Slip Window Time
+        (seconds) are configured (load >= 0, time > 0). While enabled the
+        confirmation machine gates Bit Position movement."""
+        lk = self.slip_window_load_klb
+        ts = self.slip_window_time_sec
+        return (lk is not None and ts is not None
+                and float(lk) >= 0.0 and float(ts) > 0.0)
+
+    @property
+    def slip_window_effective_load_klb(self):
+        """Effective Slip Window Load (klb): the configured (input) Slip
+        Window Load PLUS the Hookload MINIMUM VALUE — the channel-0 two-point
+        calibration low point (SENSOR_CONFIG[0] cal_val_lo). The confirmation
+        gate compares the live hookload against this combined threshold, and
+        the SLIP WINDOW LOAD readout shows it (slip window load = input value
+        + minimum value). None when the feature is unconfigured; the minimum
+        defaults to 0 when no hookload calibration is present."""
+        raw = self.slip_window_load_klb
+        if raw is None:
+            return None
+        lo = SENSOR_CONFIG[0].get("cal_val_lo")
+        try:
+            minimum = float(lo) if lo is not None else 0.0
+        except (TypeError, ValueError):
+            minimum = 0.0
+        return float(raw) + minimum
+
+    def _load_slip_window_config(self):
+        """Restore Slip Window Load (k-lb) and Time (seconds) from settings."""
+        load_klb = self._settings.get("slip_window_load_klb")
+        try:
+            self.slip_window_load_klb = (float(load_klb) if load_klb is not None
+                                         else None)
+        except (TypeError, ValueError):
+            self.slip_window_load_klb = None
+        time_sec = self._settings.get("slip_window_time_sec")
+        try:
+            self.slip_window_time_sec = (float(time_sec) if time_sec is not None
+                                         else None)
+        except (TypeError, ValueError):
+            self.slip_window_time_sec = None
+        self._reset_slip_window()
+
+    def set_slip_window_load(self, value):
+        """Save a new Slip Window Load (k-lb). Non-negative number. Returns
+        True on success; the confirmation state is re-armed."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return False
+        if v < 0.0:
+            return False
+        self.slip_window_load_klb = v
+        save_settings({"slip_window_load_klb": v})
+        self._reset_slip_window()
+        return True
+
+    def set_slip_window_time(self, value):
+        """Save a new Slip Window Time (seconds). Positive number. Returns
+        True on success; the confirmation state is re-armed."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return False
+        if v <= 0.0:
+            return False
+        self.slip_window_time_sec = v
+        save_settings({"slip_window_time_sec": v})
+        self._reset_slip_window()
+        return True
+
+    def _reset_slip_window(self):
+        """Forget any in-progress/confirmed slip state (settings changed)."""
+        self._slip_state = "NOT ACTIVE"
+        self._slip_since = None
+
+    @property
+    def hookload_klb(self):
+        """Live Hookload (klb) from the Analog Monitor's channel-0 linear
+        conversion (SENSOR_CONFIG[0], 0-5 V -> cal_min..cal_max). This is the
+        single source of hookload for the Slip Window confirmation machine and
+        the bit-position TRACK/HOLD gate (no separate hookload engine)."""
+        cfg = SENSOR_CONFIG[0]
+        v = float(self.analog_voltages[0] or 0.0)
+        return float(cfg["cal_min"]) + (v / 5.0) * (
+            float(cfg["cal_max"]) - float(cfg["cal_min"]))
+
+    def _update_slip_window(self):
+        """Advance the Slip Window confirmation machine OFF the live analog
+        hookload (slip_window.txt §16). No second hookload calculation:
+        compares the channel-0 klb value directly with the Slip Window Load
+        threshold.
+
+          NOT ACTIVE:  hookload < load          -> timer 0, bit constant
+          CONFIRMING:  hookload >= load + timer running; on elapsed span ->
+                       CONFIRMED (bit movement enabled immediately)
+          CONFIRMED:   hookload >= load -> stays confirmed; a drop below the
+                       threshold first leaves the confirmed state but PRESERVES
+                       the accumulated bit position (re-confirmation is then
+                       required for movement to resume — slip_window.txt §15).
+        """
+        if not self.slip_window_enabled:
+            self._slip_state = "NOT ACTIVE"
+            self._slip_since = None
+            return
+        hk = self.hookload_klb
+        load_klb = float(self.slip_window_effective_load_klb)
+        if hk < load_klb:
+            if self._slip_state == "CONFIRMED":
+                # A confirmed cycle later loses load: leave the confirmed state
+                # (bit position is preserved by the caller's HOLD path).
+                self._slip_state = "NOT ACTIVE"
+            else:
+                self._slip_state = "NOT ACTIVE"
+            self._slip_since = None
+            return
+        now = self._slip_clock()
+        if self._slip_state == "CONFIRMING":
+            if self._slip_since is not None and \
+                    (now - self._slip_since) >= float(self.slip_window_time_sec):
+                self._slip_state = "CONFIRMED"
+            return
+        if self._slip_state == "CONFIRMED":
+            return
+        # First time at/above threshold in this cycle: start from zero.
+        self._slip_state = "CONFIRMING"
+        self._slip_since = now
+
+    @property
+    def slip_window_status(self):
+        """Slip Window confirmation status: "NOT ACTIVE" | "CONFIRMING" |
+        "CONFIRMED". Reports NOT ACTIVE when the feature is unconfigured."""
+        return self._slip_state if self.slip_window_enabled else "NOT ACTIVE"
+
+    @property
+    def slip_window_timer_sec(self):
+        """Elapsed Slip Window confirmation time (seconds), capped at the
+        configured span. 0 outside CONFIRMING/CONFIRMED."""
+        if not self.slip_window_enabled:
+            return 0.0
+        if self._slip_state == "CONFIRMING":
+            if self._slip_since is None:
+                return 0.0
+            return min(float(self.slip_window_time_sec),
+                       max(0.0, self._slip_clock() - self._slip_since))
+        if self._slip_state == "CONFIRMED":
+            return float(self.slip_window_time_sec)
+        return 0.0
+
+    @property
+    def slip_window_active(self):
+        """True only in the CONFIRMED state (bit movement enabled)."""
+        return self.slip_window_enabled and self._slip_state == "CONFIRMED"
+
+    @property
+    def string_length_ft(self):
+        """String Length (ft), in feet, tracked with pipe movement (promt.txt):
+        String Length = Bit Position + Block Position (promt.txt §1/§16). The
+        bit depth is the authoritative, state-driven value from bit_position_ft
+        (frozen during HOLD, accumulated from the actual block delta during
+        TRACK), so this readout is always exactly Block + Bit, with no separate
+        or conflicting calculation. Before the first pipe trip the entered Pipe
+        in Hole is the bit depth, giving the historical Pipe in Hole + Block
+        Position readout. Returns None when Pipe in Hole is not configured."""
+        if self.pipe_in_hole_ft is None:
+            return None
+        bp = float(self.block_position_ft or 0.0)
+        base = self._bit_hold_ft if self._bit_hold_ft is not None else float(self.pipe_in_hole_ft)
+        return bp + float(base)
+
+    @property
+    def bit_position_state(self):
+        """Current BIT POSITION state (promt1.txt): "NONE" | "HOLD" | "TRACK"."""
+        return self._bit_state
+
+    @property
+    def bit_position_ft(self):
+        """Hookload-conditioned BIT POSITION (promt.txt), in feet. Pipe load is
+        proven by the Analog Monitor's live channel-0 Hookload (single hookload
+        source; no separate hookload engine). Gate:
+          * Slip Window ENABLED — the Slip Window confirmation machine governs:
+            TRACK only once the hookload has held >= Slip Window Load for the
+            whole Slip Window Time (CONFIRMED); otherwise HOLD.
+          * Slip Window DISABLED — TRACK whenever the live hookload is above 0
+            (pipe load proven), HOLD otherwise.
+
+          * HOLD (hookload fails to prove pipe load): returns the frozen
+            last-valid depth so the bit never moves with small block changes
+            (promt.txt §3/§14).
+          * TRACK (pipe load proven): the bit is driven by the ACTUAL Block
+            Position delta each refresh (promt.txt §4/§13/§15/§16): Block Delta
+            = Current Block - Previous Block, then New Bit = Previous Bit -
+            Block Delta. The previous block is re-anchored every time the state
+            re-enters TRACK from the live position, so the transition starts
+            from the current frozen depth with no stale-hold jump, and unloaded
+            block movement is never added to the bit (promt.txt §12). Never
+            fixed increments; full float precision; bit never negative.
+
+        Before the first trip the held depth is the entered Pipe in Hole (the
+        flat string), so the bit starts from a valid value. Returns None only
+        when Pipe in Hole is not configured (state NONE).
+        """
+        if self.pipe_in_hole_ft is None:
+            self._bit_state = "NONE"
+            self._bit_want = "NONE"
+            return None
+        hk = self.hookload_klb
+        if self.slip_window_enabled:
+            # Slip Window confirmation (slip_window.txt): Bit Position stays
+            # constant until Hookload has held >= Slip Window Load for the
+            # whole Slip Window Time (CONFIRMED). Comparing the analog
+            # channel-0 klb value directly with the Slip Window Load threshold
+            # — no second hookload calculation system.
+            self._update_slip_window()
+            want = "TRACK" if self._slip_state == "CONFIRMED" else "HOLD"
+        elif hk <= 0.0:
+            want = "HOLD"
+        else:
+            want = "TRACK"
+        # Debounce: the requested state must persist N consecutive refreshes
+        # before it is applied (promt.txt §18 stability / hysteresis). With the
+        # Slip Window confirmation active, its span already provides that
+        # stability, so the TRACK/HOLD flip mirrors the confirmation state
+        # exactly (no extra tick count on top of the confirmation time).
+        prev_state = self._bit_state
+        if self.slip_window_enabled:
+            self._bit_state = want
+        elif want == self._bit_want:
+            self._bit_confirm_ct += 1
+        else:
+            self._bit_want = want
+            self._bit_confirm_ct = 1
+        if (not self.slip_window_enabled
+                and self._bit_confirm_ct >= self._slip_stable_ticks()):
+            self._bit_state = want
+        if self._bit_state == "TRACK":
+            # The bit is driven ONLY by the actual Block Position delta
+            # (promt.txt §4/§13/§15/§16) — never by fixed increments and never
+            # by continuously recalculating it from a String Length reference:
+            #   Block Delta  = Current Block - Previous Block
+            #   Bit Delta    = -Block Delta
+            #   New Bit      = Previous Bit - Block Delta
+            bp = float(self.block_position_ft or 0.0)
+            if prev_state != "TRACK" or self._bit_track_block_ft is None:
+                # (Re-)enter TRACK: anchor the previous block at the live
+                # position so the bit continues from the current frozen depth
+                # with no jump on re-engagement (promt.txt §12). The unloaded
+                # block movement is NOT added to the bit (promt.txt §3/§14).
+                self._bit_track_block_ft = bp
+            else:
+                block_delta = bp - self._bit_track_block_ft
+                if block_delta != 0.0:
+                    self._bit_track_block_ft = bp
+                    bit = self._bit_hold_ft
+                    if bit is None:
+                        bit = float(self.pipe_in_hole_ft or 0.0)
+                    bit = bit - block_delta
+                    self._bit_hold_ft = bit if bit >= 0.0 else 0.0
+            hold = self._bit_hold_ft
+            if hold is None:
+                hold = float(self.pipe_in_hole_ft or 0.0)
+                self._bit_hold_ft = hold
+            self.pipe_in_hole_ft = hold
+            self._record_hole_depth(hold)
+            return hold
+        hold = self._bit_hold_ft
+        if hold is None:
+            hold = float(self.pipe_in_hole_ft or 0.0)
+            self._bit_hold_ft = hold
+        self.pipe_in_hole_ft = hold
+        self._record_hole_depth(hold)
+        return hold
+
+    def _record_hole_depth(self, hold):
+        """Record the latest committed bit depth for the HOLE DEPTH box. Called
+        ONLY from bit_position_ft (the single per-tick source), so reading the
+        bit advances the state machine and the running max exactly once per
+        refresh."""
+        self._hole_last_bit_ft = hold
+        if (self._hole_depth_max_ft is None
+                or float(hold) > self._hole_depth_max_ft):
+            self._hole_depth_max_ft = float(hold)
+
+    @property
+    def hole_depth_ft(self):
+        """HOLE DEPTH (ft): the deepest Bit Position the string has reached —
+        an accumulated running maximum that is NEVER decreased. The max is
+        recorded inside bit_position_ft (the single per-tick read), so this is
+        a pure getter with no side effects: the depth HOLDS while tripping /
+        coming out of the hole and only advances again when the bit runs
+        deeper. None before any bit depth has been recorded."""
+        return self._hole_depth_max_ft
+
+    @property
+    def hole_last_bit_ft(self):
+        """The most recent committed bit depth (ft), recorded by
+        bit_position_ft for the HOLE DEPTH status line. None before any depth."""
+        return self._hole_last_bit_ft
+
+    # -- MEASURED DEPTH / TVD / SAMPLE LAG DEPTH (derived display values) --
+    # promt3 §15: this rig has no standalone measured-depth, directional-survey
+    # or lag engine, so the Dashboard readouts below are single-source DISPLAY
+    # derivations that reuse the existing engines ONLY — never a second
+    # calculation, and never a hard-coded value:
+    #   * Measured Depth     -> the existing Bit Position/Bit Depth engine
+    #     (bit_position_ft): in this vertical-string block-position system the
+    #     well measured depth at the drill string equals the bit depth.
+    #   * TVD                -> Measured Depth (no directional survey exists, so
+    #     the well is treated as vertical; flagged in the Dashboard UI).
+    #   * Sample Lag Depth   -> Measured Depth - operator lag offset (feet),
+    #     i.e. the depth at which the sample now returning at surface was cut.
+    # IMPORTANT: measured_depth_ft reads bit_position_ft, the side-effectful
+    # per-tick engine read. Callers must read it ONCE per refresh cycle and
+    # reuse the returned value for the related boxes.
+    @property
+    def measured_depth_ft(self):
+        return self.bit_position_ft
+
+    @property
+    def tvd_ft(self):
+        return self.measured_depth_ft
+
+    @property
+    def sample_lag_depth_ft(self):
+        md = self.measured_depth_ft
+        if md is None:
+            return None
+        off = float(getattr(self, "sample_lag_offset_ft", 0.0) or 0.0)
+        return max(0.0, md - off)
+
     # -- audit export ----------------------------------------------------------
     def export_audit(self, fmt):
         dlg = QFileDialog()
@@ -1237,6 +2000,20 @@ class PumpDashboard(QMainWindow):
                 seed["encoderPolarity"] = 1
                 seed["confirmed"] = True
                 self.device.update(seed)
+
+                # Demo String Length: Measured Depth / TVD / Bit Depth / Sample
+                # Lag Depth are undefined until the pipe length is known, so a
+                # demo session needs one or those boxes read '--'. Set the
+                # RUNTIME fields only (exactly like _load_pipe_in_hole), never
+                # save_settings(): a demo value must not overwrite the
+                # operator's real Pipe in Hole.
+                if self.pipe_in_hole_ft is None:
+                    self.pipe_in_hole_ft = float(DEMO_PIPE_IN_HOLE_FT)
+                    self._bit_hold_ft = float(DEMO_PIPE_IN_HOLE_FT)
+                    self._bit_track_block_ft = None
+                    self._bit_state = "NONE"
+                    self._bit_want = None
+                    self._bit_confirm_ct = 0
         self.device["uptime_s"] = self._demo_counter + 100
 
         # Analog + SPM/RPM simulated signals (mirrors the reported dashboard).
@@ -1294,17 +2071,20 @@ class PumpDashboard(QMainWindow):
             cal_status = "NO_CALIBRATION"
             cal_in_range = 0
 
+        # Apply any active RESET FEET reference so the demo sweep tracks from
+        # the operator's chosen starting feet (position continuity).
+        pos = self.display_position_from_calibration(pos)
+
         prev = getattr(self, "_demo_prev_pos", pos)
         dt_sec = MS_PER_SAMPLE / 1000.0
         vel = (pos - prev) / dt_sec * 60.0 if dt_sec > 0 else 0.0
         self._demo_prev_pos = pos
-        if vel > 0.05:
-            direction = "UP"
-        elif vel < -0.05:
-            direction = "DOWN"
-        else:
-            direction = "STOPPED"
-        on_bottom = (direction == "STOPPED" and ticks <= 1)
+        # Direction is derived from the LIVE tick delta (UP/DOWN only, never
+        # NONE). The velocity value above is still used for the display and for
+        # the separate ON BOTTOM lamp, not for direction.
+        self._derive_direction(ticks)
+        direction = self.direction
+        on_bottom = (abs(vel) <= 0.05 and ticks <= 1)
         current_layer = layers_service.derive_layer(
             ticks,
             [p[0] for p in self.cal_points()])
@@ -1351,7 +2131,7 @@ class PumpDashboard(QMainWindow):
             save_settings({
                 "geometry": [geo.x(), geo.y(), geo.width(), geo.height()],
                 "maximized": maximized,
-                "role": self.roles.role(),
+                "role": ROLE_OPERATOR,   # role never persists as Engineer (promt.txt)
             })
         except Exception:
             pass
@@ -1361,6 +2141,21 @@ class PumpDashboard(QMainWindow):
         except Exception:
             pass
         event.accept()
+
+
+def _serial_ports_present():
+    """True when at least one serial port exists, i.e. a device may be attached.
+
+    Used at startup only, to decide whether simulated values are appropriate.
+    Never raises: if the port list cannot be read we assume hardware MIGHT be
+    present and leave the Dashboard honest ('--') rather than showing
+    simulated numbers next to a real device.
+    """
+    try:
+        from serial.tools import list_ports
+        return any(True for _ in list_ports.comports())
+    except Exception:
+        return True
 
 
 def main():
@@ -1377,6 +2172,14 @@ def main():
     app.setPalette(pal)
     win = PumpDashboard()
     win.show()
+    # No device attached: every Dashboard box would read '--'. Start the app's
+    # EXISTING Demo Mode so the operator sees live simulated values instead (no
+    # separate simulation is introduced). Demo is clearly flagged: the status
+    # bar reads "DEMO MODE" and the boxes read "SIMULATED". The operator stops
+    # it with the Demo Mode button, and connecting to a real device switches it
+    # off automatically (_toggle_serial).
+    if not _serial_ports_present():
+        win._toggle_demo()
     sys.exit(app.exec_())
 
 

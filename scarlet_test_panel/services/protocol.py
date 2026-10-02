@@ -13,7 +13,25 @@ match is rejected and logged (never displayed).
 import json
 
 __all__ = ["fletcher16", "validate_message", "decode_message",
-           "MessageError", "BadChecksum"]
+           "MessageError", "BadChecksum",
+           "SENSOR_STATUS_CHARS", "SENSOR_STATUS_NAMES"]
+
+# Compact per-sensor status vocabulary sent by the firmware in the
+# "sensorStatus" field of the periodic report (protocol 4.2). char[i] of the
+# 16-char string is the status of Sensor i (index 0 == Sensor 0 == the
+# hookload chain). Dashboards map the char back to the long status name.
+SENSOR_STATUS_CHARS = {
+    "N": "NORMAL",
+    "L": "LOW",
+    "H": "HIGH",
+    "F": "FAULT",
+    "D": "DISCONNECTED",
+    "C": "CALIBRATION",
+    "I": "INVALID",
+    "X": "NO DATA",
+    "U": "UNUSED",
+}
+SENSOR_STATUS_NAMES = {v: k for k, v in SENSOR_STATUS_CHARS.items()}
 
 
 class MessageError(Exception):

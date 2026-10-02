@@ -11,7 +11,7 @@ physical device:
   * EEPROM blocks guarded by magic + Fletcher-16 (calibration survives power),
   * reset semantics (counter zero + position preserved WITHOUT changing calibration),
   * two-stage configuration and the error-code table,
-  * promt2: configurable direction polarity, calibration validation, DELETE LEVEL
+  * promt2: configurable direction polarity, calibration validation, DELETE WRAP
   * promt2: calibration table input (USER PULSES / USER FEET editable cells)
   * dashboard protocol service integrity (Fletcher-16, no 0-as-falsy traps).
 
@@ -260,8 +260,8 @@ reset_guard = re.search(
 check("reset ack never treats counter 0 as falsy", bool(reset_guard),
       "currentTicks 0 handled by explicit raw-vs-None check")
 
-# ── 8. promt2: polarity, validation, DELETE LEVEL ───────────────────────
-print("8. promt2 — configurable polarity, calibration validation, DELETE LEVEL")
+# ── 8. promt2: polarity, validation, DELETE WRAP ─────────────────────────
+print("8. promt2 — configurable polarity, calibration validation, DELETE WRAP")
 enc_src = _strip_c_comments(ino)
 check("encoder direction polarity configurable (+1/-1)",
       "g_encoderPolarity" in enc_src
@@ -280,16 +280,16 @@ check("calibration validation rejects duplicates/intervals/order",
       and "CAL_VAL_BAD_ORDER" in enc_src)
 check("set_calibration_point validates before applying",
       "cal_validation_detail" in sproto and "cal_validation_code" in sproto)
-check("DELETE LEVEL (clear_calibration_point) separate from RESET COUNTER",
+check("DELETE WRAP (clear_calibration_point) separate from RESET COUNTER",
       "clear_calibration_point" in sproto
       and "encoder_clear_calibration_point" in enc_src)
 cmds_dash = _pytext(DASH).get("scarlet_test_panel\\services\\commands.py", "")
-check("dashboard DELETE LEVEL + polarity command helpers present",
+check("dashboard DELETE WRAP + polarity command helpers present",
       "clear_calibration_point" in cmds_dash
       and "set_encoder_polarity" in cmds_dash)
 block_tab = _pytext(DASH).get("scarlet_test_panel\\tabs\\block_position_tab.py", "")
-check("dashboard DELETE LEVEL + SET POLARITY UI present",
-      "DELETE LEVEL" in block_tab and "_on_delete_level" in block_tab
+check("dashboard DELETE WRAP + SET POLARITY UI present",
+      "DELETE WRAP" in block_tab and "_on_delete_level" in block_tab
       and "SET POLARITY" in block_tab and "_on_set_polarity" in block_tab)
 check("dashboard calibration table is an editable counts/position input",
       "ENCODER COUNTS" in block_tab and "POSITION (FT)" in block_tab

@@ -23,3 +23,17 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Firmware build output (arduino-cli artifacts)
+firmware_build/
+
+# Local runtime state (historian/audit databases)
+.hermetic_promt2/
+*.db
+
+# Scratch test output
+tests/_qss_*.out
+
+# Throwaway debug scripts at repo root
+/dbg*.py
+/debug_*.py

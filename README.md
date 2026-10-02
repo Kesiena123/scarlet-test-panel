@@ -93,7 +93,7 @@ scarlet_test_panel/
 | Encoder A (quadrature) | D2 (INT0) |
 | Encoder B (quadrature) | D3 (INT1) |
 | Reset button (active-low to GND) | D4 |
-| Serial → dashboard | USB (UART0, 9600 8N1) |
+| Serial → dashboard | USB (UART0, 115200 8N1) |
 
 Both quadrature inputs are `INPUT_PULLUP`, active-low against the pull-ups
 (promt1.txt). Reset is a momentary button to GND, software-debounced

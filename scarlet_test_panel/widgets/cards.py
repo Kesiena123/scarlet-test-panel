@@ -181,6 +181,7 @@ class SensorPanel(QGroupBox):
         self.accent = accent_color
         self._last_volts = 0.0
         self._active = True
+        self._disabled = False
 
         self._t = theme.current()
         self._build(cfg, calibrate_callback)
@@ -324,11 +325,7 @@ class SensorPanel(QGroupBox):
         self._style_toggle(self._active)
         self.volt_gauge.setActive(self._active)
         self.cal_gauge.setActive(self._active)
-        if not self._active:
-            self.volt_display.setText("—")
-            self.cal_display.setText("—")
-        else:
-            self.setVoltage(self._last_volts)
+        self._render()
 
     def isActive(self):
         return self._active
@@ -365,8 +362,24 @@ class SensorPanel(QGroupBox):
     def setVoltage(self, volts):
         volts = max(0.0, min(5.0, float(volts)))
         self._last_volts = volts
+        self._render()
+
+    def setDisabled(self, disabled):
+        self._disabled = bool(disabled)
+        self._render()
+
+    def _render(self):
         if not self._active:
+            self.volt_display.setText("—")
+            self.cal_display.setText("—")
             return
+        if self._disabled:
+            self.volt_gauge.setValue(0.0)
+            self.cal_gauge.setValue(self.cfg["cal_min"])
+            self.volt_display.setText("DISABLED")
+            self.cal_display.setText("DISABLED")
+            return
+        volts = self._last_volts
         frac = volts / 5.0
         cal = self.cfg["cal_min"] + frac * (self.cfg["cal_max"] - self.cfg["cal_min"])
         self.volt_gauge.setValue(volts)
